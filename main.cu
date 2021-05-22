@@ -407,20 +407,36 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 
 		setupMalvar(stream);
-		auto debayer = Image::create(Image::Type::ppm, original->width, original->height);
-		//f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-		//f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+		auto debayer1 = Image::create(Image::Type::ppm, original->width, original->height);
+		auto debayer2 = Image::create(Image::Type::ppm, original->width, original->height);
+		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
+		f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer1->mem.device.data,
+				debayer1->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
+		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer2->mem.device.data,
+				debayer2->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
 		f_pgm8_debayer_adams_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer->mem.device.data,
-				debayer->mem.device.pitch,
+				debayer3->mem.device.data,
+				debayer3->mem.device.pitch,
 				bayer->mem.device.data,
 				bayer->mem.device.pitch,
 				bayer->width,
 				bayer->height
 		);
 		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer->mem.device.data,
-				debayer->mem.device.pitch,
+				debayer3->mem.device.data,
+				debayer3->mem.device.pitch,
 				bayer->mem.device.data,
 				bayer->mem.device.pitch,
 				bayer->width,
@@ -431,6 +447,9 @@ int main(int /*argc*/, char** /*argv*/)
 		cudaDeviceSynchronize();
 
 		display.cudaMap(stream);
+
+		int i = 0;
+		Image* debayer[] = { debayer1, debayer2, debayer3 };
 		while (true)
 		{
 #if 0
@@ -446,10 +465,10 @@ int main(int /*argc*/, char** /*argv*/)
 			f_ppm8<<<gridSize, blockSize, 0, stream>>>(
 				display.CUDA.frame.data,
 				display.CUDA.frame.pitch,
-				debayer->mem.device.data,
-				debayer->mem.device.pitch,
-				debayer->width,
-				debayer->height
+				debayer[i%3]->mem.device.data,
+				debayer[i%3]->mem.device.pitch,
+				debayer[i%3]->width,
+				debayer[i%3]->height
 			);
 #endif
 
@@ -468,7 +487,8 @@ int main(int /*argc*/, char** /*argv*/)
 				cudaStreamDestroy(stream);
 				return 0;
 			}
-			usleep(1000);
+			usleep(1000000);
+			i++;
 		}
 	}
 	catch (const char* &ex)
