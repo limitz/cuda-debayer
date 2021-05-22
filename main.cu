@@ -33,6 +33,21 @@ void f_test(float4* out, int pitch_out, int width, int height)
 }
 
 __global__
+void f_pgm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+
+	uchar1 p = ((uchar1*)(((uint8_t*) in) + pitch_in * y))[x];
+	out[y * pitch_out / sizeof(float4) + x] = make_float4(
+			p.x / 255.0f,
+			p.x / 255.0f,
+			p.x / 255.0f,
+			1.0);
+}
+
+__global__
 void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
@@ -48,7 +63,7 @@ void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t wid
 }
 
 __global__
-void f_ppm8_bayer(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+void f_ppm8_bayer_pgm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
@@ -56,11 +71,53 @@ void f_ppm8_bayer(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t
 
 	uchar3 m  = make_uchar3(~(x | y) & 1, (x ^ y) & 1,x & y & 1); 
 	uchar3 p  = ((uchar3*)(((uint8_t*) in)  + pitch_in  * y))[x];
-	uchar3* o = ((uchar3*)(((uint8_t*) out) + pitch_out * y)) + x;
-	*o = make_uchar3(
-			m.x * p.x,
-			m.y * p.y,
+	uchar1* o = ((uchar1*)(((uint8_t*) out) + pitch_out * y)) + x;
+	*o = make_uchar1(
+			m.x * p.x +
+			m.y * p.y +
 			m.z * p.z);
+}
+
+__global__
+void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+	if (x < 1 || y < 1 || x >= width-1 || y >= height-1) return;
+
+	uint8_t r,g,b;
+	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
+	uint8_t* s2 = s1 + pitch_in;
+	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	
+	// red
+	o1[0] = make_uchar3(
+		(s1[0]),
+		(s1[-1] + s1[+1] + s1[-pitch_in] + s1[pitch_in]  ) / 4,
+		(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
+	);
+	
+	// red green
+	o1[1] = make_uchar3(
+		(s1[0] + s1[2]) / 2,
+		s1[1],
+		(s1[1-pitch_in] + s1[1+pitch_in]) / 2
+	);
+
+	// blue
+	o2[1] = make_uchar3(
+		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
+		(s2[0] + s2[+2] + s2[1-pitch_in] + s2[1+pitch_in]) / 4,
+		s2[1]
+	);
+	
+	// blue green
+	o2[0] = make_uchar3(
+		(s2[-pitch_in] + s2[pitch_in]) / 2,
+		s2[0],
+		(s2[-1] + s2[1]) / 2
+	);
 }
 
 int smToCores(int major, int minor)
@@ -154,6 +211,16 @@ int main(int /*argc*/, char** /*argv*/)
 		printf("Selecting the best GPU\n");
 		selectGPU();
 		
+		dim3 blockSize = { 16, 16 };
+		dim3 gridSize = { 
+			(WIDTH  + blockSize.x - 1) / blockSize.x, 
+			(HEIGHT + blockSize.y - 1) / blockSize.y 
+		}; 
+		dim3 gridSizeQ = { 
+			(WIDTH/2  + blockSize.x - 1) / blockSize.x, 
+			(HEIGHT/2 + blockSize.y - 1) / blockSize.y 
+		}; 
+
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
@@ -161,36 +228,54 @@ int main(int /*argc*/, char** /*argv*/)
 		original->printInfo();
 		original->copyToDevice(stream);
 
+		auto bayer = Image::create(Image::Type::pgm8, original->width, original->height);
+		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
+				bayer->data.device,
+				bayer->pitch,
+				original->data.device,
+				original->pitch,
+				original->width,
+				original->height
+		);
+
+		auto debayer = Image::create(Image::Type::ppm8, original->width, original->height);
+		f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer->data.device,
+				debayer->pitch,
+				bayer->data.device,
+				bayer->pitch,
+				bayer->width,
+				bayer->height
+		);
+
 		printf("Creating screen\n");
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
 		cudaDeviceSynchronize();
 		
-		dim3 blockSize = { 16, 16 };
-		dim3 gridSize = { 
-			(WIDTH  + blockSize.x - 1) / blockSize.x, 
-			(HEIGHT + blockSize.y - 1) / blockSize.y 
-		}; 
-
 		display.cudaMap(stream);
 		while (true)
 		{
-			f_ppm8_bayer<<<gridSize, blockSize, 0, stream>>>(
-				original->data.device,
-				original->pitch,
-				original->data.device,
-				original->pitch,
-				original->width,
-				original->height
+#if 0
+			f_pgm8<<<gridSize, blockSize, 0, stream>>>(
+				display.CUDA.frame.data,
+				display.CUDA.frame.pitch,
+				bayer->data.device,
+				bayer->pitch,
+				bayer->width,
+				bayer->height
 			);
+#else
+
 			f_ppm8<<<gridSize, blockSize, 0, stream>>>(
 				display.CUDA.frame.data,
 				display.CUDA.frame.pitch,
-				original->data.device,
-				original->pitch,
-				original->width,
-				original->height
+				debayer->data.device,
+				debayer->pitch,
+				debayer->width,
+				debayer->height
 			);
-			
+#endif
+
 			// Draw the pixelbuffer on screen
 			display.cudaFinish(stream);
 			display.render(stream);
