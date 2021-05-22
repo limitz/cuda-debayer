@@ -79,7 +79,7 @@ void f_ppm8_bayer_pgm8(void* out, size_t pitch_out, void* in, size_t pitch_in, s
 }
 
 __global__
-void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, bool skipGreens = false)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
@@ -97,6 +97,13 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 		(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
 	);
 	
+	// blue
+	o2[1] = make_uchar3(
+		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
+		(s2[0] + s2[+2] + s2[1-pitch_in] + s2[1+pitch_in]) / 4,
+		s2[1]
+	);
+
 	// red green
 	o1[1] = make_uchar3(
 		(s1[0] + s1[2]) / 2,
@@ -104,13 +111,6 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 		(s1[1-pitch_in] + s1[1+pitch_in]) / 2
 	);
 
-	// blue
-	o2[1] = make_uchar3(
-		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
-		(s2[0] + s2[+2] + s2[1-pitch_in] + s2[1+pitch_in]) / 4,
-		s2[1]
-	);
-	
 	// blue green
 	o2[0] = make_uchar3(
 		(s2[-pitch_in] + s2[pitch_in]) / 2,
@@ -201,6 +201,90 @@ void f_pgm8_debayer_malvar_ppm8(void* out, size_t pitch_out, void* in, size_t pi
 	o1[1] = make_uchar3(trg.x>>4, trg.y, trg.z>>4);
 	o2[0] = make_uchar3(tbg.x>>4, tbg.y, tbg.z>>4);
 	o2[1] = make_uchar3(tbb.x>>4, tbb.y>>4, tbb.z);
+}
+
+__global__
+void f_pgm8_debayer_adams_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
+	
+	uint8_t* s0 = ((uint8_t*) in) + pitch_in * y + x;
+	uchar3*  o0 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	
+	// greens
+	o0[1] = make_uchar3(0, s0[1], 0);
+	o0[pitch_out] = make_uchar3(0, s0[pitch_in], 0);
+
+	// greens at red / blue positions
+	#pragma unroll
+	for (int i=0; i<2; i++)
+	{
+		uint8_t* s = s0 + i * (pitch_in  + 1);
+		uchar3*  o = o0 + i * (pitch_out + 1);
+		int dh = abs(s[-1] - s[1])  + abs(2 * s[0] - s[2] - s[-2]);
+		int dv = abs(s[-pitch_in] - s[pitch_in]) + abs(2 * s[0] - s[2*pitch_in] - s[-2*pitch_in]);
+		if (dh > dv) 
+			o[0] = make_uchar3(
+				0, 
+				(s[-pitch_in]+s[pitch_in]) * 0.5 
+					+ (2 * s[0] - s[-2*pitch_in] - s[2*pitch_in]) * 0.25,
+				0);
+		else if (dh < dv) 
+			o[0] = make_uchar3(
+				0,
+				(s[-1] + s[1]) * 0.5 
+					+ (2 * s[0] - s[-2] - s[2]) * 0.25,
+				0);
+		else
+			o[0] = make_uchar3(
+				0,
+				(s[-pitch_in] + s[pitch_in] + s[-1] + s[1]) * 0.25 
+					+ (4 * s[0] - s[-2*pitch_in] - s[2*pitch_in] - s[-2] - s[2]) * 0.125,
+				0);
+	}
+}
+
+__global__
+void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, bool skipGreens = false)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+	if (x < 1 || y < 1 || x >= width-1 || y >= height-1) return;
+
+	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
+	uint8_t* s2 = s1 + pitch_in;
+	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	
+	// red
+	o1[0] = make_uchar3(
+		(s1[0]),
+		(o1[0].y),
+		(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
+	);
+	
+	// blue
+	o2[1] = make_uchar3(
+		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
+		(o2[1].y),
+		s2[1]
+	);
+
+	// red green
+	o1[1] = make_uchar3(
+		(s1[0] + s1[2]) / 2,
+		o1[1].y,
+		(s1[1-pitch_in] + s1[1+pitch_in]) / 2
+	);
+
+	// blue green
+	o2[0] = make_uchar3(
+		(s2[-pitch_in] + s2[pitch_in]) / 2,
+		o2[0].y,
+		(s2[-1] + s2[1]) / 2
+	);
 }
 
 int smToCores(int major, int minor)
@@ -325,7 +409,8 @@ int main(int /*argc*/, char** /*argv*/)
 		setupMalvar(stream);
 		auto debayer = Image::create(Image::Type::ppm, original->width, original->height);
 		//f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+		//f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+		f_pgm8_debayer_adams_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer->mem.device.data,
 				debayer->mem.device.pitch,
 				bayer->mem.device.data,
@@ -333,7 +418,14 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
-
+		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer->mem.device.data,
+				debayer->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
 		printf("Creating screen\n");
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
 		cudaDeviceSynchronize();
