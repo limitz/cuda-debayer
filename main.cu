@@ -309,27 +309,27 @@ int main(int /*argc*/, char** /*argv*/)
 
 
 		auto original = Image::load("sheep.ppm");
-		original->printInfo();
 		original->copyToDevice(stream);
+		original->printInfo();
 
-		auto bayer = Image::create(Image::Type::pgm8, original->width, original->height);
+		auto bayer = Image::create(Image::Type::pgm, original->width, original->height);
 		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
-				bayer->data.device,
-				bayer->pitch,
-				original->data.device,
-				original->pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				original->mem.device.data,
+				original->mem.device.pitch,
 				original->width,
 				original->height
 		);
 
 		setupMalvar(stream);
-		
-		auto debayer = Image::create(Image::Type::ppm8, original->width, original->height);
+		auto debayer = Image::create(Image::Type::ppm, original->width, original->height);
+		//f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer->data.device,
-				debayer->pitch,
-				bayer->data.device,
-				bayer->pitch,
+				debayer->mem.device.data,
+				debayer->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
 				bayer->width,
 				bayer->height
 		);
@@ -337,7 +337,7 @@ int main(int /*argc*/, char** /*argv*/)
 		printf("Creating screen\n");
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
 		cudaDeviceSynchronize();
-		
+
 		display.cudaMap(stream);
 		while (true)
 		{
@@ -345,23 +345,23 @@ int main(int /*argc*/, char** /*argv*/)
 			f_pgm8<<<gridSize, blockSize, 0, stream>>>(
 				display.CUDA.frame.data,
 				display.CUDA.frame.pitch,
-				bayer->data.device,
-				bayer->pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
 				bayer->width,
 				bayer->height
 			);
 #else
-
 			f_ppm8<<<gridSize, blockSize, 0, stream>>>(
 				display.CUDA.frame.data,
 				display.CUDA.frame.pitch,
-				debayer->data.device,
-				debayer->pitch,
+				debayer->mem.device.data,
+				debayer->mem.device.pitch,
 				debayer->width,
 				debayer->height
 			);
 #endif
 
+			cudaStreamSynchronize(stream);
 			// Draw the pixelbuffer on screen
 			display.cudaFinish(stream);
 			display.render(stream);

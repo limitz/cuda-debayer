@@ -16,67 +16,43 @@ static const char* strrstr(const char* c, const char* find)
 Image::~Image()
 {
 	if (_filename) free(_filename);
-	if (data.host) cudaFreeHost(data.host);
-	if (data.device) cudaFree(data.device);
+	if (mem.host.data) cudaFreeHost(mem.host.data);
+	if (mem.device.data) cudaFree(mem.device.data);
 }
 
 Image::Image()
 {
 	_filename = nullptr;
-	data.host = nullptr;
-	data.device = nullptr;
+	mem.host.data = nullptr;
+	mem.device.data = nullptr;
 	filename = nullptr;
 	width = 0;
 	height = 0;
-	pitch = 0;
+	mem.host.pitch = 0;
+	mem.device.pitch = 0;
+	channels = 0;
+	bpp = 0;
 	type = Type::unknown;
 }
 
-static size_t typeToBpp(Image::Type type)
-{
-	size_t bpp;
-	switch (type)
-	{
-		case Image::Type::jpeg:
-		case Image::Type::ppm8:
-			bpp = 24;
-			break;
-		case Image::Type::ppm12:
-		case Image::Type::ppm16:
-			bpp = 48;
-			break;
-		case Image::Type::pgm8:
-			bpp = 8;
-			break;
-		case Image::Type::pgm12:
-		case Image::Type::pgm16:
-			bpp = 16;
-			break;
-		default:
-			throw "Invalid image type";
-	}
-	return bpp;
-}
-
-
 void Image::copyToHost(cudaStream_t stream)
 {
-	size_t srcPitch = width * (typeToBpp(type) >> 3);
 	int rc = cudaMemcpy2DAsync(
-			data.host, srcPitch, 
-			data.device, pitch, 
-			srcPitch, height,
+			mem.host.data, mem.host.pitch, 
+			mem.device.data, mem.device.pitch, 
+			width * (bpp >> 3) * channels, 
+			height,
 			cudaMemcpyDeviceToHost, 
 			stream); 
 	if (cudaSuccess != rc) throw "Unable to copy from device to host";
 }
 void Image::copyToDevice(cudaStream_t stream)
 {
-	size_t srcPitch = width * (typeToBpp(type) >> 3);
 	int rc = cudaMemcpy2DAsync(
-			data.device, pitch, 
-			data.host, srcPitch, 
-			srcPitch, height,
+			mem.device.data, mem.device.pitch, 
+			mem.host.data, mem.host.pitch, 
+			width * (bpp >> 3) * channels, 
+			height,
 			cudaMemcpyHostToDevice, 
 			stream); 
 	if (cudaSuccess != rc) throw "Unable to copy from host to device";
@@ -89,36 +65,50 @@ void Image::printInfo()
 	switch (type)
 	{
 		case Type::unknown: typeName = "unknown"; break;
-		case Type::jpeg:  typeName = "JPEG"; break;
-		case Type::ppm8:  typeName = "PPM (8bpp RGB)"; break;
-		case Type::ppm12: typeName = "PPM (12bpp RGB)"; break;
-		case Type::ppm16: typeName = "PPM (16bpp RGB)"; break;
-		case Type::pgm8:  typeName = "PGM (8bpp Grayscale)"; break;
-		case Type::pgm12: typeName = "PGM (12bpp Grayscale)"; break;
-		case Type::pgm16: typeName = "PGM (16bpp Grayscale)"; break;
+		case Type::jpeg: typeName = "JPEG"; break;
+		case Type::ppm:  typeName = "PPM"; break;
+		case Type::pgm:  typeName = "PGM"; break;
 		default: typeName = "INVALID!"; break;
 	}
-	printf("- TYPE: %s\n", typeName);
-	printf("- SIZE: %lu x %lu (pitch:%lu)\n", width, height, pitch);
+	printf("- TYPE:  %s\n", typeName);
+	printf("- SIZE:  %lu x %lu\n", width, height);
+	printf("- PITCH: %lu (dev), %lu (host)\n", mem.device.pitch, mem.host.pitch);
+	printf("- RANGE: 0x%lX\n", range);
 	printf("\n");
 	fflush(stdout);
 }
 
-Image* Image::create(Type type, size_t width, size_t height)
+Image* Image::create(Type type, size_t width, size_t height, size_t bpp)
 {
 	int rc;
 	auto result = new Image();
-	size_t bpp = typeToBpp(type);
 	
-	rc = cudaMallocHost(&result->data.host, width * height * (bpp >> 3));
-	if (cudaSuccess != rc) throw "Unable to allocate host memory for image";
-
-	rc = cudaMallocPitch(&result->data.device, &result->pitch, width * (bpp >> 3), height);
-	if (cudaSuccess != rc) throw "Unable to allocate device memory for image";
 
 	result->width = width;
 	result->height = height;
 	result->type = type;
+	result->bpp = bpp;
+
+	switch (type)
+	{
+		case Type::jpeg: 
+		case Type::ppm:
+			result->channels=3; 
+			break;
+		case Type::pgm:
+			result->channels=1;
+			break;
+		default: throw "Invalid image type";
+	}
+	result->range = (1 << result->bpp) - 1;
+	result->mem.host.pitch = width * (bpp >> 3) * result->channels;
+	rc = cudaMallocHost(&result->mem.host.data, result->mem.host.pitch * height);
+	if (cudaSuccess != rc) throw "Unable to allocate host memory for image";
+
+	rc = cudaMallocPitch(&result->mem.device.data, &result->mem.device.pitch, 
+			width * (bpp >> 3) * result->channels, height);
+	if (cudaSuccess != rc) throw "Unable to allocate device memory for image";
+	
 	return result;
 }
 
@@ -129,35 +119,22 @@ void Image::loadPPM()
 	FILE* f = fopen(filename, "rb");
 	if (!f) throw "Unable to open file";
 
-	size_t maxval, bpp;
-	rc = fscanf(f, "P6 %lu %lu %lu \n", &width, &height, &maxval);
+	rc = fscanf(f, "P6 %lu %lu %lu \n", &width, &height, &range);
 	if (rc <= 0) throw "Unable to read PPM header";
+	
+	type = Type::ppm;
+	channels = 3;
+	if (range < 256) bpp = 8;
+	else bpp = 16;
 
-	switch (maxval)
-	{
-		case 0xFF:
-			type = Type::ppm8;
-			bpp = 24;
-			break;
-		case 0xFFF:
-			type = Type::ppm12;
-			bpp = 48;
-			break;
-		case 0xFFFF:
-			type = Type::ppm16;
-			bpp = 48;
-			break;
-		default:
-			throw "Unexpected max val";
-	}
-
-	rc = cudaMallocHost(&data.host, width * height * (bpp >> 3));
+	mem.host.pitch = width * (bpp >> 3) * channels;
+	rc = cudaMallocHost(&mem.host.data, mem.host.pitch * height);
 	if (cudaSuccess != rc) throw "Unable to allocate host memory for image";
 
-	rc = cudaMallocPitch(&data.device, &pitch, width * (bpp >> 3), height);
+	rc = cudaMallocPitch(&mem.device.data, &mem.device.pitch, width * (bpp >> 3) * channels, height);
 	if (cudaSuccess != rc) throw "Unable to allocate device memory for image";
 
-	rc = fread(data.host, 1, width * height * (bpp >> 3), f);
+	rc = fread(mem.host.data, 1, mem.host.pitch * height, f);
 	if (rc <= 0) throw "Unable to read image data from PPM";
 
 	fclose(f);

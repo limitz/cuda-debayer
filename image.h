@@ -17,32 +17,35 @@ public:
 	{
 		unknown,
 		jpeg,
-		ppm8,
-		ppm12,
-		ppm16,
-		pgm8,
-		pgm12,
-		pgm16,
+		ppm,
+		pgm,
 	} type;
 
-	size_t width, height, pitch;
+	size_t width, height, range, channels, bpp;
 	const char* filename;
 
 	struct
 	{
-		void* host;
-		void* device;
-	} data;
+		struct
+		{
+			void* data;
+			size_t pitch;
+		} host, device;
+	} mem;
 
 	~Image();
 
-	static Image* create(Type type, size_t width, size_t height);
+	static Image* create(Type type, size_t width, size_t height, size_t bpp=8);
 	static Image* load(const char* filename = nullptr);
 	static Image* save(const char* filename = nullptr);
 
 	void copyToDevice(cudaStream_t stream);
 	void copyToHost(cudaStream_t stream);
 	void printInfo();
+
+	float sharpness8();
+	float psnr(const Image* reference);
+
 private:
 	Image();
 
