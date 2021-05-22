@@ -85,7 +85,6 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x < 1 || y < 1 || x >= width-1 || y >= height-1) return;
 
-	uint8_t r,g,b;
 	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
 	uint8_t* s2 = s1 + pitch_in;
 	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
@@ -118,6 +117,90 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 		s2[0],
 		(s2[-1] + s2[1]) / 2
 	);
+}
+
+__constant__ int32_t malvar[4][5][5];
+void setupMalvar(cudaStream_t stream)
+{
+	int32_t pmalvar[4][5][5] = 
+	{
+		{
+			{  0,  0, -2,  0,  0},
+			{  0,  0,  4,  0,  0},
+			{ -2,  4,  8,  4, -2},
+			{  0,  0,  4,  0,  0},
+			{  0,  0, -2,  0,  0}
+		},
+		{
+			{  0,  0,  1,  0,  0},
+			{  0, -2,  0, -2,  0},
+			{ -2,  8, 10,  8, -2},
+			{  0, -2,  0, -2,  0},
+			{  0,  0,  1,  0,  0}
+		},
+		{
+			{  0,  0, -2,  0,  0},
+			{  0, -2,  8, -2,  0},
+			{  1,  0, 10,  0,  1},
+			{  0, -2,  8, -2,  0},
+			{  0,  0, -2,  0,  0}
+		},
+		{
+			{  0,  0, -3,  0,  0},
+			{  0,  4,  0,  4,  0},
+			{ -3,  0, 12,  0, -3},
+			{  0,  4,  0,  4,  0},
+			{  0,  0, -3,  0,  0}
+		}
+	};
+	int rc = cudaMemcpyToSymbolAsync(malvar, &pmalvar, 4*5*5*sizeof(int32_t), 0, cudaMemcpyHostToDevice, stream);
+	if (cudaSuccess != rc) throw "Unable to copy malvar kernels";
+}
+
+__global__
+void f_pgm8_debayer_malvar_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
+
+	uint8_t* s0 = ((uint8_t*) in)  + pitch_in  * (y-2) + x - 2;
+	uint8_t* s1 = s0 + 2 * pitch_in + 2;
+	uint8_t* s2 = s1 + pitch_in;
+	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	
+	// red
+	int3 trr = make_int3(s1[0], 0, 0);
+	int3 trg = make_int3(0, s1[1], 0);
+	int3 tbg = make_int3(0, s2[0], 0);
+	int3 tbb = make_int3(0, 0, s2[1]);
+
+	for (int i=0; i<5; i++)
+	{
+		uint8_t* s = s0 + i * pitch_in;
+		#pragma unroll
+		for (int j=0; j<5; j++)
+		{
+			trr.y += malvar[0][i][j] * s[j];
+			trr.z += malvar[3][i][j] * s[j];
+			trg.x += malvar[1][i][j] * s[j+1];
+			trg.z += malvar[2][i][j] * s[j+1];
+			tbg.x += malvar[2][i][j] * s[j+pitch_in];
+			tbg.z += malvar[1][i][j] * s[j+pitch_in];
+			tbb.x += malvar[3][i][j] * s[j+pitch_in+1];
+			tbb.y += malvar[0][i][j] * s[j+pitch_in+1];
+		}
+	}
+	trr = clamp(trr, 0, 255 << 4);
+	trg = clamp(trg, 0, 255 << 4);
+	tbg = clamp(tbg, 0, 255 << 4);
+	tbb = clamp(tbb, 0, 255 << 4);
+
+	o1[0] = make_uchar3(trr.x, trr.y>>4, trr.z>>4);
+	o1[1] = make_uchar3(trg.x>>4, trg.y, trg.z>>4);
+	o2[0] = make_uchar3(tbg.x>>4, tbg.y, tbg.z>>4);
+	o2[1] = make_uchar3(tbb.x>>4, tbb.y>>4, tbb.z);
 }
 
 int smToCores(int major, int minor)
@@ -224,6 +307,7 @@ int main(int /*argc*/, char** /*argv*/)
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
+
 		auto original = Image::load("sheep.ppm");
 		original->printInfo();
 		original->copyToDevice(stream);
@@ -238,8 +322,10 @@ int main(int /*argc*/, char** /*argv*/)
 				original->height
 		);
 
+		setupMalvar(stream);
+		
 		auto debayer = Image::create(Image::Type::ppm8, original->width, original->height);
-		f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer->data.device,
 				debayer->pitch,
 				bayer->data.device,
