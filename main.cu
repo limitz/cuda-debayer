@@ -212,37 +212,35 @@ void f_pgm8_debayer_adams_ppm8(void* out, size_t pitch_out, void* in, size_t pit
 	
 	uint8_t* s0 = ((uint8_t*) in) + pitch_in * y + x;
 	uchar3*  o0 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
 	
 	// greens
 	o0[1] = make_uchar3(0, s0[1], 0);
-	o0[pitch_out] = make_uchar3(0, s0[pitch_in], 0);
+	o1[0] = make_uchar3(0, s0[pitch_in], 0);
 
 	// greens at red / blue positions
+	int treshold = 0;
 	#pragma unroll
 	for (int i=0; i<2; i++)
 	{
 		uint8_t* s = s0 + i * (pitch_in  + 1);
-		uchar3*  o = o0 + i * (pitch_out + 1);
+		uchar3*  o = i ? o1 + 1 : o0;
 		int dh = abs(s[-1] - s[1])  + abs(2 * s[0] - s[2] - s[-2]);
 		int dv = abs(s[-pitch_in] - s[pitch_in]) + abs(2 * s[0] - s[2*pitch_in] - s[-2*pitch_in]);
-		if (dh > dv) 
-			o[0] = make_uchar3(
-				0, 
-				(s[-pitch_in]+s[pitch_in]) * 0.5 
-					+ (2 * s[0] - s[-2*pitch_in] - s[2*pitch_in]) * 0.25,
-				0);
-		else if (dh < dv) 
-			o[0] = make_uchar3(
-				0,
-				(s[-1] + s[1]) * 0.5 
-					+ (2 * s[0] - s[-2] - s[2]) * 0.25,
-				0);
+		float green;
+		
+		if (dh > dv+treshold) 
+			green = (s[-pitch_in]+s[pitch_in]) * 0.5 
+			      + (2 * s[0] - s[-2*pitch_in] - s[2*pitch_in]) * 0.25;
+
+		else if (dv > dh+treshold) 
+			green = (s[-1] + s[1]) * 0.5 
+			      + (2 * s[0] - s[-2] - s[2]) * 0.25;
+
 		else
-			o[0] = make_uchar3(
-				0,
-				(s[-pitch_in] + s[pitch_in] + s[-1] + s[1]) * 0.25 
-					+ (4 * s[0] - s[-2*pitch_in] - s[2*pitch_in] - s[-2] - s[2]) * 0.125,
-				0);
+			green = (s[-pitch_in] + s[pitch_in] + s[-1] + s[1]) * 0.25 
+			      + (4 * s[0] - s[-2*pitch_in] - s[2*pitch_in] - s[-2] - s[2]) * 0.125;
+		o[0].y = (uint8_t) clamp(green, 0.0f, 255.0f);
 	}
 }
 
@@ -251,7 +249,7 @@ void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t 
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x < 1 || y < 1 || x >= width-1 || y >= height-1) return;
+	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
 
 	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
 	uint8_t* s2 = s1 + pitch_in;
@@ -260,31 +258,31 @@ void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	
 	// red
 	o1[0] = make_uchar3(
-		(s1[0]),
-		(o1[0].y),
-		(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
-	);
+			(s1[0]),
+			(o1[0].y),
+			(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
+		);
 	
 	// blue
 	o2[1] = make_uchar3(
-		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
-		(o2[1].y),
-		s2[1]
-	);
+			(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
+			(o2[1].y),
+			s2[1]
+		);
 
 	// red green
 	o1[1] = make_uchar3(
-		(s1[0] + s1[2]) / 2,
-		o1[1].y,
-		(s1[1-pitch_in] + s1[1+pitch_in]) / 2
-	);
+			(s1[0] + s1[2]) / 2,
+			o1[1].y,
+			(s1[1-pitch_in] + s1[1+pitch_in]) / 2
+		);
 
 	// blue green
 	o2[0] = make_uchar3(
-		(s2[-pitch_in] + s2[pitch_in]) / 2,
-		o2[0].y,
-		(s2[-1] + s2[1]) / 2
-	);
+			(s2[-pitch_in] + s2[pitch_in]) / 2,
+			o2[0].y,
+			(s2[-1] + s2[1]) / 2
+		);
 }
 
 int smToCores(int major, int minor)
@@ -418,6 +416,8 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+		debayer1->copyToHost(stream);
+		
 		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer2->mem.device.data,
 				debayer2->mem.device.pitch,
@@ -426,6 +426,8 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+		debayer2->copyToHost(stream);
+		
 		f_pgm8_debayer_adams_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer3->mem.device.data,
 				debayer3->mem.device.pitch,
@@ -442,11 +444,19 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
-		printf("Creating screen\n");
+		debayer3->copyToHost(stream);
+
+
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
 		cudaDeviceSynchronize();
-
 		display.cudaMap(stream);
+		
+		printf("PSNR\n");
+		printf("- Bilinear: %0.02f\n", debayer1->psnr(original));
+		printf("- Malvar:   %0.02f\n", debayer2->psnr(original));
+		printf("- Adams:    %0.02f\n", debayer3->psnr(original));
+		printf("Creating screen\n");
+
 
 		int i = 0;
 		Image* debayer[] = { debayer1, debayer2, debayer3 };

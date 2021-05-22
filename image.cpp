@@ -1,4 +1,5 @@
 #include <image.h>
+#include <math.h>
 
 static const char* strrstr(const char* c, const char* find)
 {
@@ -161,6 +162,43 @@ Image* Image::load(const char* filename)
 	if (!strcmp(extension, ".pgm"))  result->loadPGM();
 
 	return result;
+}
+
+float Image::psnr(const Image* ref)
+{
+	float mse = 0;
+	for (size_t x=2; x<width-2; x++)
+	{
+		for (size_t y=2; y<height-2; y++)
+		{
+			for (size_t c=0; c<channels; c++)
+			{
+				void* p = ((uint8_t*)mem.host.data
+						+ y * mem.host.pitch
+						+ (x * channels + c) * (bpp>>3));
+
+				void* q = ((uint8_t*)ref->mem.host.data
+						+ y * ref->mem.host.pitch
+						+ (x * channels + c) * (bpp>>3));
+				float pv,qv;
+				switch (bpp)
+				{
+					case 8:
+						pv = (float)*(uint8_t*)p;
+						qv = (float)*(uint8_t*)q;
+						break;
+					case 16:
+						pv = (float)*(uint16_t*)p;
+						qv = (float)*(uint16_t*)q;
+						break;
+					default: throw "Unable to calculate PSNR due to unexpected bpp";
+				}
+				mse += (pv - qv) * (pv - qv);
+			}
+		}
+	}
+	mse /= width * height * channels;
+	return 20 * log10(range) - 10 * log10(mse);
 }
 
 JpegCodec::JpegCodec()
