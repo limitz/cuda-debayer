@@ -237,10 +237,10 @@ void f_pgm8_debayer_adams_gg_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
 	
 	// greens
-	d(0,0) = make_uchar3(s(0,0), 0, 0);
+	d(0,0) = make_uchar3(0, 0, 0);
 	d(1,0) = make_uchar3(0, s(1,0), 0);
 	d(0,1) = make_uchar3(0, s(0,1), 0);
-	d(1,1) = make_uchar3(0, 0, s(1,1));
+	d(1,1) = make_uchar3(0, 0, 0);
 
 	// greens at red / blue positions
 	int treshold = 1;
@@ -274,8 +274,10 @@ void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
 	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
 	
+	d(0,0).x = (s(0,0));
 	d(0,0).z = (s(-1,-1)+s(1,-1)+s(-1,1)+s(1,1)) >> 2;
-	d(1,1).x = (s( 0, 0)+s(2, 0)+s( 0,2)+s(2,2)) >> 2,
+	d(1,1).x = (s( 0, 0)+s(2, 0)+s( 0,2)+s(2,2)) >> 2;
+	d(1,1).z = (s(1,1));
 	d(1,0).x = (s( 0, 0)+s(2, 0)) >> 1;
 	d(1,0).z = (s( 1,-1)+s(1, 1)) >> 1;
 	d(0,1).x = (s( 0, 0)+s(0, 2)) >> 1;
@@ -357,60 +359,39 @@ void f_pgm8_debayer_gunturk_gg1_ppm8(void* out, size_t pitch_out, void* in, size
 { 
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x < 4 || y < 4 || x >= width-4 || y >= height-4) return;
+	if (x >= width || y >= height) return;
 
-	float3* ca2 = ((float3*)(((uint8_t*)gunturk_ca) + gunturk_pitch * (y))) + x;
-	float3* ch2 = ((float3*)(((uint8_t*)gunturk_ch) + gunturk_pitch * (y))) + x;
-	float3* cv2 = ((float3*)(((uint8_t*)gunturk_cv) + gunturk_pitch * (y))) + x;
-	float3* cd2 = ((float3*)(((uint8_t*)gunturk_cd) + gunturk_pitch * (y))) + x;
-	float3* ca3 = ((float3*)(((uint8_t*)gunturk_ca) + gunturk_pitch * (y+1))) + x;
-	float3* ch3 = ((float3*)(((uint8_t*)gunturk_ch) + gunturk_pitch * (y+1))) + x;
-	float3* cv3 = ((float3*)(((uint8_t*)gunturk_cv) + gunturk_pitch * (y+1))) + x;
-	float3* cd3 = ((float3*)(((uint8_t*)gunturk_cd) + gunturk_pitch * (y+1))) + x;
-
-	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
-	uint8_t* s2 = s1 + pitch_in;
-	uint8_t* s0 = s1 - pitch_in;
+	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto s = View<uint8_t>(in, pitch_in, x, y, width, height);
+	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
 	
-	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
-	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	float*h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
 
-	ca2[0] = ch2[0] = cv2[0] = cd2[0] = make_float3(0,0,0); 
-	ca2[1] = ch2[1] = cv2[1] = cd2[1] = make_float3(0,0,0); 
-	ca3[0] = ch3[0] = cv3[0] = cd3[0] = make_float3(0,0,0); 
-	ca3[1] = ch3[1] = cv3[1] = cd3[1] = make_float3(0,0,0); 
-	for (int i=0; i<3; i++)
+	ca(0,0) = ch(0,0) = cv(0,0) = cd(0,0) = make_float3(0,0,0); 
+	ca(0,1) = ch(0,1) = cv(0,1) = cd(0,1) = make_float3(0,0,0); 
+	ca(1,0) = ch(1,0) = cv(1,0) = cd(1,0) = make_float3(0,0,0); 
+	ca(1,1) = ch(1,1) = cv(1,1) = cd(1,1) = make_float3(0,0,0); 
+
+	for (int r=-2; r<4; r+=2)
 	{
 		#pragma unroll
-		for (int j=0; j<3; j++)
+		for (int c=-2; c<4; c+=2, h00++, h10++, h01++, h11++)
 		{
-			uint8_t rr = s1[(2*i-2) * pitch_in + j*2-2];
-			ca2[0].x += rr * gunturk_h00[i*3+j];
-			ch2[0].x += rr * gunturk_h10[i*3+j];
-			cv2[0].x += rr * gunturk_h01[i*3+j];
-			cd2[0].x += rr * gunturk_h11[i*3+j];
+			uint8_t rr = s(c, r), bb = s(c+1, r+1);
+			ca(0,0).x += rr * *h00,	ca(1,1).z += bb * *h00;
+			ch(0,0).x += rr * *h10,	ch(1,1).z += bb * *h10;
+			cv(0,0).x += rr * *h01, cv(1,1).z += bb * *h01;
+			cd(0,0).x += rr * *h11,	cd(1,1).z += bb * *h11;
+			ca(0,0).y += d(c, r).y * *h00;
+			ca(1,1).y += d(c+1, r+1).y * *h00;
 			
-			uint8_t rg = ((uchar3*)(((uint8_t*)o1) + (2*i-2) * pitch_out))[j*2-2].y;
-			ca2[0].y += rg * gunturk_h00[i*3+j];
-
-			uint8_t bb = s1[(2*i-1) * pitch_in + j*2-1];
-			ca3[1].z += bb * gunturk_h00[i*3+j];
-			ch3[1].z += bb * gunturk_h10[i*3+j];
-			cv3[1].z += bb * gunturk_h01[i*3+j];
-			cd3[1].z += bb * gunturk_h11[i*3+j];
-			
-			uint8_t bg = ((uchar3*)(((uint8_t*)o1) + (2*i-1) * pitch_out))[j*2-1].y;
-			ca3[1].y += bg * gunturk_h00[i*3+j];
 		}
 	}
-
-	ch2[0].y = ch2[0].x;
-	cv2[0].y = ch2[0].x;
-	cd2[0].y = cd2[0].x;
-	ch3[1].y = ch3[1].z;
-	cv3[1].y = cv3[1].z;
-	cd3[1].y = cd3[1].z;
-
+	ch(0,0).y = ch(0,0).x, cv(0,0).y = ch(0,0).x, cd(0,0).y = cd(0,0).x;
+	ch(1,1).y = ch(1,1).z, cv(1,1).y = cv(1,1).z, cd(1,1).y = cd(1,1).z;
 }
 
 
@@ -419,45 +400,39 @@ void f_pgm8_debayer_gunturk_gg2_ppm8(void* out, size_t pitch_out, void* in, size
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x < 4 || y < 4 || x >= width-4 || y >= height-4) return;
+	if (x >= width || y >= height) return;
 
-	float3* ca = ((float3*)(((uint8_t*)gunturk_ca) + gunturk_pitch * (y-4))) + x;
-	float3* ch = ((float3*)(((uint8_t*)gunturk_ch) + gunturk_pitch * (y-4))) + x;
-	float3* cv = ((float3*)(((uint8_t*)gunturk_cv) + gunturk_pitch * (y-4))) + x;
-	float3* cd = ((float3*)(((uint8_t*)gunturk_cd) + gunturk_pitch * (y-4))) + x;
-	float3* temp0 = ((float3*)(((uint8_t*)gunturk_temp) + gunturk_pitch * y)) + x;
-	float3* temp1 = ((float3*)(((uint8_t*)gunturk_temp) + gunturk_pitch * (y+1))) + x;
+	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto temp = View<float3>(gunturk_temp, gunturk_pitch, x, y, width, height);
+	auto s = View<uint8_t>(in, pitch_in, x, y, width, height);
+	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
+
+	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
 	
-	temp0[0] =  temp0[1] = temp1[0] = temp1[1] = make_float3(0,0,0);
-	for (int i=0; i<5; i++)
-	{
-		float3* ca0 = ((float3*)(((uint8_t*)ca) + 2*i * gunturk_pitch));
-		float3* ch0 = ((float3*)(((uint8_t*)ch) + 2*i * gunturk_pitch));
-		float3* cv0 = ((float3*)(((uint8_t*)cv) + 2*i * gunturk_pitch));
-		float3* cd0 = ((float3*)(((uint8_t*)cd) + 2*i * gunturk_pitch));
+	temp(0,0) =  temp(1,0) = temp(0,1) = temp(1,1) = make_float3(0,0,0);
 
-		float3* ca1 = ((float3*)(((uint8_t*)ca) + (2*i+1) * gunturk_pitch));
-		float3* ch1 = ((float3*)(((uint8_t*)ch) + (2*i+1) * gunturk_pitch));
-		float3* cv1 = ((float3*)(((uint8_t*)cv) + (2*i+1) * gunturk_pitch));
-		float3* cd1 = ((float3*)(((uint8_t*)cd) + (2*i+1) * gunturk_pitch));
+	for (int r=-4; r<6; r+=2)
+	{
 		#pragma unroll
-		for (int j=0; j<5; j++)
+		for (int c=-4; c<6; c+=2, g00++, g10++, g01++, g11++)
 		{
-			temp0[0].y += ca0[j*2-4].y * gunturk_g00[i*5+j];
-			temp0[0].y += ch0[j*2-4].y * gunturk_g10[i*5+j];
-			temp0[0].y += cv0[j*2-4].y * gunturk_g01[i*5+j];
-			temp0[0].y += cd0[j*2-4].y * gunturk_g11[i*5+j];
-			temp1[1].y += ca1[j*2-3].y * gunturk_g00[i*5+j];
-			temp1[1].y += ch1[j*2-3].y * gunturk_g10[i*5+j];
-			temp1[1].y += cv1[j*2-3].y * gunturk_g01[i*5+j];
-			temp1[1].y += cd1[j*2-3].y * gunturk_g11[i*5+j];
+			temp(0,0).y += ca(c,r).y * *g00;
+			             + ch(c,r).y * *g10;
+			             + cv(c,r).y * *g01;
+			             + cd(c,r).y * *g11;
+			
+			temp(1,1).y += ca(c+1,r+1).y * *g00;
+			             + ch(c+1,r+1).y * *g10;
+			             + cv(c+1,r+1).y * *g01;
+			             + cd(c+1,r+1).y * *g11;
 		}
 	}
 
-	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
-	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
-	o1[0] = make_uchar3(0, clamp(temp0[0].y, 0.f, 255.f),0);
-	o2[1] = make_uchar3(0, clamp(temp1[1].y, 0.f, 255.f),0);
+	d(0,0).y = clamp(temp(0,0).y, 0.f, 255.f);
+	d(1,1).y = clamp(temp(1,1).y, 0.f, 255.f);
 }
 
 __global__
