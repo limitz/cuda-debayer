@@ -33,13 +33,13 @@ void f_test(float4* out, int pitch_out, int width, int height)
 }
 
 __global__
-void f_pgm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+void f_pgm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 
-	uchar1 p = ((uchar1*)(((uint8_t*) in) + pitch_in * y))[x];
+	uchar1 p = ((uchar1*)(((uint8_t*) in) + pitch_in * y / scale))[x / scale];
 	out[y * pitch_out / sizeof(float4) + x] = make_float4(
 			p.x / 255.0f,
 			p.x / 255.0f,
@@ -48,13 +48,13 @@ void f_pgm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t wid
 }
 
 __global__
-void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 
-	uchar3 p = ((uchar3*)(((uint8_t*) in) + pitch_in * y))[x];
+	uchar3 p = ((uchar3*)(((uint8_t*) in) + pitch_in * (y / scale)))[x / scale];
 	out[y * pitch_out / sizeof(float4) + x] = make_float4(
 			p.x / 255.0f,
 			p.y / 255.0f,
@@ -83,77 +83,51 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x < 1 || y < 1 || x >= width-1 || y >= height-1) return;
+	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
 
-	uint8_t* s1 = (((uint8_t*) in)  + pitch_in  * y) + x;
-	uint8_t* s2 = s1 + pitch_in;
 	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
 	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	uint8_t* s0 = (((uint8_t*) in)  + pitch_in * (y-1)) + x;
+	uint8_t* s1 = s0 + pitch_in;
+	uint8_t* s2 = s1 + pitch_in;
+	uint8_t* s3 = s2 + pitch_in;
 	
-	// red
-	o1[0] = make_uchar3(
-		(s1[0]),
-		(s1[-1] + s1[+1] + s1[-pitch_in] + s1[pitch_in]  ) / 4,
-		(s1[-1-pitch_in] + s1[1-pitch_in] + s1[pitch_in-1] + s1[pitch_in+1]) / 4
-	);
-	
-	// blue
-	o2[1] = make_uchar3(
-		(s2[-pitch_in] + s2[+2-pitch_in] + s2[pitch_in] + s2[pitch_in+2]) / 4,
-		(s2[0] + s2[+2] + s2[1-pitch_in] + s2[1+pitch_in]) / 4,
-		s2[1]
-	);
-
-	// red green
-	o1[1] = make_uchar3(
-		(s1[0] + s1[2]) / 2,
-		s1[1],
-		(s1[1-pitch_in] + s1[1+pitch_in]) / 2
-	);
-
-	// blue green
-	o2[0] = make_uchar3(
-		(s2[-pitch_in] + s2[pitch_in]) / 2,
-		s2[0],
-		(s2[-1] + s2[1]) / 2
-	);
+	o1[0] = make_uchar3((s1[0]), (s1[-1]+s1[1]+s0[0]+s2[0])>>2, (s2[-1]+s0[1]+s2[-1]+s2[1])>>2);
+	o2[1] = make_uchar3((s0[0]+s1[2]+s3[0]+s3[2])>>2, (s2[0]+s2[2]+s1[1]+s3[1])>>2, (s2[1]));
+	o1[1] = make_uchar3((s1[0]+s1[2])>>1, (s1[1]), (s0[ 1]+s2[1])>>1);
+	o2[0] = make_uchar3((s1[0]+s3[0])>>1, (s2[0]), (s2[-1]+s2[1])>>1);
 }
 
-__constant__ int32_t malvar[4][5][5];
+__constant__ int32_t malvar[100];
 void setupMalvar(cudaStream_t stream)
 {
-	int32_t pmalvar[4][5][5] = 
+	int32_t pmalvar[100] = 
 	{
-		{
-			{  0,  0, -2,  0,  0},
-			{  0,  0,  4,  0,  0},
-			{ -2,  4,  8,  4, -2},
-			{  0,  0,  4,  0,  0},
-			{  0,  0, -2,  0,  0}
-		},
-		{
-			{  0,  0,  1,  0,  0},
-			{  0, -2,  0, -2,  0},
-			{ -2,  8, 10,  8, -2},
-			{  0, -2,  0, -2,  0},
-			{  0,  0,  1,  0,  0}
-		},
-		{
-			{  0,  0, -2,  0,  0},
-			{  0, -2,  8, -2,  0},
-			{  1,  0, 10,  0,  1},
-			{  0, -2,  8, -2,  0},
-			{  0,  0, -2,  0,  0}
-		},
-		{
-			{  0,  0, -3,  0,  0},
-			{  0,  4,  0,  4,  0},
-			{ -3,  0, 12,  0, -3},
-			{  0,  4,  0,  4,  0},
-			{  0,  0, -3,  0,  0}
-		}
+		 0,  0, -2,  0,  0,
+		 0,  0,  4,  0,  0,
+		-2,  4,  8,  4, -2,
+		 0,  0,  4,  0,  0,
+		 0,  0, -2,  0,  0,
+
+		 0,  0,  1,  0,  0,
+		 0, -2,  0, -2,  0,
+		-2,  8, 10,  8, -2,
+		 0, -2,  0, -2,  0,
+		 0,  0,  1,  0,  0,
+
+		 0,  0, -2,  0,  0,
+		 0, -2,  8, -2,  0,
+		 1,  0, 10,  0,  1,
+		 0, -2,  8, -2,  0,
+		 0,  0, -2,  0,  0,
+		
+		 0,  0, -3,  0,  0,
+		 0,  4,  0,  4,  0,
+		-3,  0, 12,  0, -3,
+		 0,  4,  0,  4,  0,
+		 0,  0, -3,  0,  0,
 	};
-	int rc = cudaMemcpyToSymbolAsync(malvar, &pmalvar, 4*5*5*sizeof(int32_t), 0, cudaMemcpyHostToDevice, stream);
+	int rc = cudaMemcpyToSymbolAsync(malvar, &pmalvar, 100*sizeof(int32_t), 0, cudaMemcpyHostToDevice, stream);
 	if (cudaSuccess != rc) throw "Unable to copy malvar kernels";
 }
 
@@ -164,11 +138,11 @@ void f_pgm8_debayer_malvar_ppm8(void* out, size_t pitch_out, void* in, size_t pi
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
 
-	uint8_t* s0 = ((uint8_t*) in)  + pitch_in  * (y-2) + x - 2;
-	uint8_t* s1 = s0 + 2 * pitch_in + 2;
-	uint8_t* s2 = s1 + pitch_in;
 	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
 	uchar3*  o2 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+	uint8_t* s1 = ((uint8_t*) in) + pitch_in  * y + x;
+	uint8_t* s2 = s1 + pitch_in;
+	uint8_t* ss = s1 - 2 * pitch_in - 2;
 	
 	// red
 	int3 trr = make_int3(s1[0], 0, 0);
@@ -176,31 +150,52 @@ void f_pgm8_debayer_malvar_ppm8(void* out, size_t pitch_out, void* in, size_t pi
 	int3 tbg = make_int3(0, s2[0], 0);
 	int3 tbb = make_int3(0, 0, s2[1]);
 
-	for (int i=0; i<5; i++)
+	for (int i=0, *m=malvar; i<5; i++, ss += pitch_in)
 	{
-		uint8_t* s = s0 + i * pitch_in;
+		uint8_t* t0 = ss;
+		uint8_t* t1 = ss + pitch_in;
+
 		#pragma unroll
-		for (int j=0; j<5; j++)
+		for (int j=0; j<5; j++, t0++, t1++, m++)
 		{
-			trr.y += malvar[0][i][j] * s[j];
-			trr.z += malvar[3][i][j] * s[j];
-			trg.x += malvar[1][i][j] * s[j+1];
-			trg.z += malvar[2][i][j] * s[j+1];
-			tbg.x += malvar[2][i][j] * s[j+pitch_in];
-			tbg.z += malvar[1][i][j] * s[j+pitch_in];
-			tbb.x += malvar[3][i][j] * s[j+pitch_in+1];
-			tbb.y += malvar[0][i][j] * s[j+pitch_in+1];
+			trr.y += m[ 0] * t0[0];
+			trr.z += m[75] * t0[0];
+			trg.x += m[25] * t0[1];
+			trg.z += m[50] * t0[1];
+			tbg.x += m[50] * t1[0];
+			tbg.z += m[25] * t1[0];
+			tbb.x += m[75] * t1[1];
+			tbb.y += m[ 0] * t1[1];
 		}
 	}
-	trr = clamp(trr, 0, 255 << 4);
-	trg = clamp(trg, 0, 255 << 4);
-	tbg = clamp(tbg, 0, 255 << 4);
-	tbb = clamp(tbb, 0, 255 << 4);
+	trr = clamp(trr, 0, 0xFF0);
+	trg = clamp(trg, 0, 0xFF0);
+	tbg = clamp(tbg, 0, 0xFF0);
+	tbb = clamp(tbb, 0, 0xFF0);
 
 	o1[0] = make_uchar3(trr.x, trr.y>>4, trr.z>>4);
 	o1[1] = make_uchar3(trg.x>>4, trg.y, trg.z>>4);
 	o2[0] = make_uchar3(tbg.x>>4, tbg.y, tbg.z>>4);
 	o2[1] = make_uchar3(tbb.x>>4, tbb.y>>4, tbb.z);
+}
+
+__global__
+void f_pgm8_debayer_nn_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x)*2;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y)*2;
+	if (x < 2 || y < 2 || x >= width-2 || y >= height-2) return;
+
+	uint8_t* s0 = ((uint8_t*) in) + pitch_in * (y+0) + x;
+	uint8_t* s1 = ((uint8_t*) in) + pitch_in * (y+1) + x;
+	uint8_t* s2 = ((uint8_t*) in) + pitch_in * (y+2) + x;
+	uchar3*  o0 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+0))) + x;	
+	uchar3*  o1 = ((uchar3*)(((uint8_t*)out) + pitch_out * (y+1))) + x;	
+
+	o0[0] = make_uchar3(s0[0], (s0[1] + s1[0])/2, s1[1]);
+	o0[1] = make_uchar3(s0[2], (s0[1] + s1[2])/2, s1[1]);
+	o1[0] = make_uchar3(s2[0], (s2[1] + s1[0])/2, s1[1]);
+	o1[1] = make_uchar3(s2[2], (s2[1] + s1[2])/2, s1[1]);
 }
 
 __global__
@@ -219,7 +214,7 @@ void f_pgm8_debayer_adams_ppm8(void* out, size_t pitch_out, void* in, size_t pit
 	o1[0] = make_uchar3(0, s0[pitch_in], 0);
 
 	// greens at red / blue positions
-	int treshold = 0;
+	int treshold = 3;
 	#pragma unroll
 	for (int i=0; i<2; i++)
 	{
@@ -405,9 +400,20 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 
 		setupMalvar(stream);
+		auto debayer0 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer1 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer2 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
+		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer0->mem.device.data,
+				debayer0->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
+		debayer0->copyToHost(stream);
+		
 		f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer1->mem.device.data,
 				debayer1->mem.device.pitch,
@@ -452,6 +458,7 @@ int main(int /*argc*/, char** /*argv*/)
 		display.cudaMap(stream);
 		
 		printf("PSNR\n");
+		printf("- Nearest:  %0.02f\n", debayer0->psnr(original));
 		printf("- Bilinear: %0.02f\n", debayer1->psnr(original));
 		printf("- Malvar:   %0.02f\n", debayer2->psnr(original));
 		printf("- Adams:    %0.02f\n", debayer3->psnr(original));
@@ -459,7 +466,7 @@ int main(int /*argc*/, char** /*argv*/)
 
 
 		int i = 0;
-		Image* debayer[] = { debayer1, debayer2, debayer3 };
+		Image* debayer[] = { debayer0, debayer1, debayer2, debayer3 };
 		while (true)
 		{
 #if 0
@@ -475,10 +482,11 @@ int main(int /*argc*/, char** /*argv*/)
 			f_ppm8<<<gridSize, blockSize, 0, stream>>>(
 				display.CUDA.frame.data,
 				display.CUDA.frame.pitch,
-				debayer[i%3]->mem.device.data,
-				debayer[i%3]->mem.device.pitch,
-				debayer[i%3]->width,
-				debayer[i%3]->height
+				debayer[i%4]->mem.device.data,
+				debayer[i%4]->mem.device.pitch,
+				debayer[i%4]->width,
+				debayer[i%4]->height,
+				4
 			);
 #endif
 
