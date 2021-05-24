@@ -419,30 +419,92 @@ void f_pgm8_debayer_gunturk_gg2_ppm8(void* out, size_t pitch_out, void* in, size
 		#pragma unroll
 		for (int c=-4; c<6; c+=2, g00++, g10++, g01++, g11++)
 		{
-			temp(0,0).y += ca(c,r).y * *g00;
-			             + ch(c,r).y * *g10;
-			             + cv(c,r).y * *g01;
+			temp(0,0).y += ca(c,r).y * *g00
+			             + ch(c,r).y * *g10
+			             + cv(c,r).y * *g01
 			             + cd(c,r).y * *g11;
 			
-			temp(1,1).y += ca(c+1,r+1).y * *g00;
-			             + ch(c+1,r+1).y * *g10;
-			             + cv(c+1,r+1).y * *g01;
+			temp(1,1).y += ca(c+1,r+1).y * *g00
+			             + ch(c+1,r+1).y * *g10
+			             + cv(c+1,r+1).y * *g01
 			             + cd(c+1,r+1).y * *g11;
 		}
 	}
-
+	d(0,0).x = s(0,0);
+	d(1,1).z = s(1,1);
 	d(0,0).y = clamp(temp(0,0).y, 0.f, 255.f);
 	d(1,1).y = clamp(temp(1,1).y, 0.f, 255.f);
 }
 
 __global__
-void f_pgm8_debayer_gunturk_rb_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x < 4 || y < 4 || x >= width-4 || y >= height-4) return;
+void f_pgm8_debayer_gunturk_rb1_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{ 
+	int x = (blockIdx.x * blockDim.x + threadIdx.x) ;
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
 
+	auto ca = &View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height)(0,0);
+	auto ch = &View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height)(0,0);
+	auto cv = &View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height)(0,0);
+	auto cd = &View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height)(0,0);
+	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
 	
+	float *h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
+
+	*ca = *ch = *cv = *cd = make_float3(0,0,0); 
+	
+	#pragma unroll
+	for (int r=-1; r<2; r++)
+	{
+		#pragma unroll
+		for (int c=-1; c<2; c++, h00++, h10++, h01++, h11++)
+		{
+			uchar3 v = d(c, r);
+			float3 f = make_float3(v.x, v.y, v.z);
+			*ca += f * *h00;
+			*ch += f * *h10;
+			*cv += f * *h01;
+			*cd += f * *h11;
+		}
+	}
+	ch->x = ch->z = ch->y;
+	cv->x = cv->z = cv->y;
+	cd->x = cd->z = cd->y;
+}
+
+__global__
+void f_pgm8_debayer_gunturk_rb2_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+
+	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto t = &View<float3>(gunturk_temp, gunturk_pitch, x, y, width, height)(0,0);
+	auto d = &View<uchar3>(out, pitch_out, x, y, width, height)(0,0);
+
+	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
+	
+	*t = make_float3(0,0,0);
+	
+	#pragma unroll
+	for (int r=-2; r<3; r++)
+	{
+		#pragma unroll
+		for (int c=-2; c<3; c++, g00++, g10++, g01++, g11++)
+		{
+			*t += ca(c,r) * *g00
+			    + ch(c,r) * *g10
+			    + cv(c,r) * *g01
+			    + cd(c,r) * *g11;
+		}
+	}
+
+	d->x = IS_R(x,y) * d->x + (1-IS_R(x,y)) * clamp(t->x, 0.0f, 255.0f);
+	d->z = IS_B(x,y) * d->z + (1-IS_B(x,y)) * clamp(t->z, 0.0f, 255.0f);
 }
 
 int smToCores(int major, int minor)
@@ -580,6 +642,7 @@ int main(int /*argc*/, char** /*argv*/)
 		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer4 = Image::create(Image::Type::ppm, original->width, original->height);
 
+		// NEAREST NEIGHBOR
 		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer0->mem.device.data,
 				debayer0->mem.device.pitch,
@@ -590,6 +653,7 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 		debayer0->copyToHost(stream);
 		
+		// BILINEAR
 		f_pgm8_debayer_bilinear_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer1->mem.device.data,
 				debayer1->mem.device.pitch,
@@ -600,7 +664,7 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 		debayer1->copyToHost(stream);
 	
-		
+		// MALVAR
 		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer2->mem.device.data,
 				debayer2->mem.device.pitch,
@@ -611,6 +675,7 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 		debayer2->copyToHost(stream);
 		
+		// HAMILTON ADAMS
 		f_pgm8_debayer_adams_gg_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer3->mem.device.data,
 				debayer3->mem.device.pitch,
@@ -629,8 +694,25 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 		debayer3->copyToHost(stream);
 
+		// GUNTURK
 		setupGunturk(stream, bayer->width, bayer->height);
 		f_pgm8_debayer_adams_gg_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer4->mem.device.data,
+				debayer4->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
+		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
+				debayer4->mem.device.data,
+				debayer4->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+		);
+		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer4->mem.device.data,
 				debayer4->mem.device.pitch,
 				bayer->mem.device.data,
@@ -655,8 +737,30 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+		for (int i=0; i<8; i++)
+		{
+			f_pgm8_debayer_gunturk_rb1_ppm8<<<gridSize, blockSize, 0, stream>>>(	
+				debayer4->mem.device.data,
+				debayer4->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+			);
+		
+			f_pgm8_debayer_gunturk_rb2_ppm8<<<gridSize, blockSize, 0, stream>>>(
+				debayer4->mem.device.data,
+				debayer4->mem.device.pitch,
+				bayer->mem.device.data,
+				bayer->mem.device.pitch,
+				bayer->width,
+				bayer->height
+			);
+		}
 		debayer4->copyToHost(stream);
 
+
+		// SETUP DISPLAY
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
 		cudaDeviceSynchronize();
 		display.cudaMap(stream);
@@ -732,6 +836,15 @@ int main(int /*argc*/, char** /*argv*/)
 					case 's': dy-=10; break;
 					case 'a': dx+=10; break;
 					case 'd': dx-=10; break;
+					case '0': 
+					case '1':
+					case '2':
+					case '3':
+					case '4':
+					case '5':
+					case '6':
+						  i = e - '0';
+						  break;
 					default: break;
 				}
 			}
