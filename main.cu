@@ -192,7 +192,9 @@ void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height)
 	if (x >= width || y >= height) return;
 	
 	float3* px = RC(float3, lab, pitch_in, x, y, width, height);
-	px->x *= 1;
+	px->x *= 0.6;
+	px->y *= 2;
+	px->z *= 2;
 }
 
 __global__
@@ -230,6 +232,97 @@ void f_cielab(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t w
 			p.x - p.y + p.z/2, 
 			p.x - p.z, 1.0);
 }
+__global__
+void f_ppm8_sobel_mask(float3* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
+{	
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+
+	auto d = View<float3>(out, pitch_out, x, y, width, height);
+	auto s = View<uchar3>(in, pitch_in, x, y, width, height);
+
+	float Kg[25] = {
+		-2,+2, 0,+2,-2,
+		+2,-2, 0,-2,+2,
+		 0, 0, 0, 0, 0,
+		+2,-2, 0,-2,+2,
+		-2,+2, 0,+2,-2
+	}; 
+	float Kx[25] = {
+		 0,+0, 0,-0,-0,
+		 0,+2, 0,-2,-0,
+		 0,+3, 0,-3,-0,
+		 0,+2, 0,-2,-0,
+		 0,+0, 0,-0,-0
+	};
+	float Ky[25] = {
+		+0,+0,+0,+0,+0,
+		+0,+2,+3,+2,+0,
+		 0, 0, 0, 0, 0,
+		-0,-2,-3,-0,-0,
+		-0,-0,-0,-0,-0
+	};
+
+	float3 Lx = make_float3(0,0,0);
+	float3 Ly = make_float3(0,0,0);
+
+	#pragma unroll
+	for (int r=-2, i=0; r<3; r++, i++)
+	{
+		#pragma unroll
+		for (int c=-2, j=0; c<3; c++, j++)
+		{
+			float  fg = Kg[i*5+j]/255.0;
+			float  fx = Kg[i*5+j]/255.0;
+			float  fy = Kg[i*5+j]/255.0;
+			uchar3 ux = s(c,r);
+			uchar3 uy = s(c,r);
+			Lx.x += fx * ux.x;
+			Lx.y += fx * ux.y;
+			Lx.z += fx * ux.z;
+			Ly.x += fy * uy.x;
+			Ly.y += fy * uy.y;
+			Ly.z += fy * uy.z;
+		}
+	}
+	
+	float3 Lg = clamp(make_float3(
+			sqrt(Lx.x*Lx.x + Ly.x*Ly.x),
+			sqrt(Lx.y*Lx.y + Ly.y*Ly.y),
+			sqrt(Lx.z*Lx.z + Ly.z*Ly.z)
+			), 0.0f, 1.0f);
+	d(0,0) = Lg;
+}
+
+__global__
+void f_ppm8_blend(
+		uchar3* out, size_t pitch_out, 
+		uchar3* a, size_t pitch_a, 
+		uchar3* b, size_t pitch_b, 
+		float3* mask, size_t pitch_mask, 
+		size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+
+	float3 f = *RC(float3, mask, pitch_mask, x, y, width, height);
+	uchar3 va = *RC(uchar3, a, pitch_a, x, y, width, height);
+	uchar3 vb = *RC(uchar3, b, pitch_b, x, y, width, height);
+	float3 ia = make_float3(
+			f.x * va.x / 255.0f,
+			f.y * va.y / 255.0f,
+			f.z * va.z / 255.0f);
+	float3 ib = make_float3(
+			(1-f.x) * vb.x / 255.0f,
+			(1-f.y) * vb.y / 255.0f,
+			(1-f.z) * vb.z / 255.0f);
+	float3 blend = ia+ib;
+
+	*RC(uchar3, out, pitch_out, x, y, width, height) = make_uchar3(blend.x*255, blend.y*255, blend.z*255);
+}
+
 __global__
 void f_ppm8_bayer_pgm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
 {
@@ -770,7 +863,7 @@ int main(int /*argc*/, char** /*argv*/)
 				original->width,
 				original->height
 		);
-		
+#if 0	
 		f_cielab_enhance<<<gridSize, blockSize, 0, stream>>>(
 				cielab, cielab_pitch, original->width, original->height);
 		
@@ -780,7 +873,7 @@ int main(int /*argc*/, char** /*argv*/)
 				original->width,
 				original->height
 		);
-
+#endif
 		auto bayer = Image::create(Image::Type::pgm, original->width, original->height);
 		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
 				bayer->mem.device.data,
@@ -814,6 +907,7 @@ int main(int /*argc*/, char** /*argv*/)
 		auto debayer2 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer4 = Image::create(Image::Type::ppm, original->width, original->height);
+		auto debayer5 = Image::create(Image::Type::ppm, original->width, original->height);
 
 		// NEAREST NEIGHBOR
 		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
@@ -867,7 +961,7 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 		debayer3->copyToHost(stream);
 
-		// GUNTURK
+		// GUNTURK / ADAMS
 		setupGunturk(stream, bayer->width, bayer->height);
 		f_pgm8_debayer_adams_gg_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer4->mem.device.data,
@@ -878,14 +972,6 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->height
 		);
 		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-		f_pgm8_debayer_malvar_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer4->mem.device.data,
 				debayer4->mem.device.pitch,
 				bayer->mem.device.data,
@@ -932,6 +1018,24 @@ int main(int /*argc*/, char** /*argv*/)
 		}
 		debayer4->copyToHost(stream);
 
+		// GUNTURK / MALVAR
+		float3* mask;
+		size_t mask_pitch;
+		cudaMallocPitch(&mask, &mask_pitch, sizeof(float3) * original->width, original->height);
+
+		f_ppm8_sobel_mask<<<gridSize, blockSize, 0, stream>>>(
+				mask, mask_pitch,
+				debayer4->mem.device.data, debayer4->mem.device.pitch,
+				debayer4->width, debayer4->height);
+		f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
+				(uchar3*)debayer5->mem.device.data, debayer5->mem.device.pitch,
+				(uchar3*)debayer2->mem.device.data, debayer2->mem.device.pitch,
+				(uchar3*)debayer4->mem.device.data, debayer4->mem.device.pitch,
+				mask, mask_pitch,
+				debayer5->width, debayer5->height);
+
+		debayer5->copyToHost(stream);
+
 
 		// SETUP DISPLAY
 		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
@@ -944,20 +1048,22 @@ int main(int /*argc*/, char** /*argv*/)
 		printf("- Malvar:   %0.02f\n", debayer2->psnr(original));
 		printf("- Adams:    %0.02f\n", debayer3->psnr(original));
 		printf("- Gunturk:  %0.02f\n", debayer4->psnr(original));
+		printf("- Gunturk Malvar: %0.02f\n", debayer5->psnr(original));
 		printf("Creating screen\n");
 
 
 		int i = 0;
-		int count = 7;
+		int count = 8;
 		int scale = 1;
 		int dx = 0, dy = 0;
 
-		Image* debayer[] = { bayer, bayer_colored, debayer0, debayer1, debayer2, debayer3, debayer4 };
+		Image* debayer[] = { bayer, bayer_colored, 
+			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5 };
 		while (true)
 		{
 			if (!i)
 			{
-#if 0
+#if 1
 				f_pgm8<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
@@ -968,7 +1074,7 @@ int main(int /*argc*/, char** /*argv*/)
 					scale,
 					dx*scale, dy*scale
 				);
-#endif
+#else
 				f_cielab<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
@@ -979,7 +1085,7 @@ int main(int /*argc*/, char** /*argv*/)
 					scale,
 					dx*scale, dy*scale
 				);
-
+#endif
 			}
 			else
 			{
@@ -1029,6 +1135,7 @@ int main(int /*argc*/, char** /*argv*/)
 					case '4':
 					case '5':
 					case '6':
+					case '7':
 						  i = e - '0';
 						  break;
 					default: break;
