@@ -14,6 +14,8 @@
 #include <math.h>
 #include <operators.h>
 #include <image.h>
+#include <sobel.h>
+#include <view.h>
 
 #ifndef TITLE
 #define TITLE "CUDA DEBAYER DEMO"
@@ -25,48 +27,6 @@
 #define IS_G(x,y) ((x^y)&1)
 #define IS_B(x,y) (x&y&1)
 
-template <typename T>
-class View
-{
-public:
-	__device__
-	View(void* ptr, size_t ptr_pitch, int dx, int dy, size_t w, size_t h) 
-	{
-		data = (uint8_t*) ptr;
-		pitch = ptr_pitch;
-		width = w, height = h;
-		x = dx, y = dy;
-	}		
-	
-	__device__ ~View(){}
-
-	__device__
-	T& operator()(int dx, int dy)
-	{
-		return ((T*)(data + pitch * SYM(y + dy, height)))[SYM(x + dx, width)];
-	}
-
-	__device__
-	View translated(int dx, int dy) const
-	{
-		return View(data, pitch, x+dx, y+dy, width, height);
-	}
-
-	__device__
-	void translate(int dx, int dy)
-	{
-		y += dy;
-		x += dx;
-	}
-
-	uint8_t* data;
-	size_t pitch;
-	size_t width;
-	size_t height;
-	int x;
-	int y;
-};
-
 #define Lab_e 0.008856f
 #define Lab_k 903.3f
 #define Lab_v 0.0031308
@@ -76,125 +36,19 @@ __constant__ __device__ float Lab_M[9];
 __constant__ __device__ float Lab_Mi[9];
 __constant__ __device__ float3 Lab_W;
 
-void setupCielab(cudaStream_t stream)
-{
-	int rc;
-	float pW[3] = { 0.95047f, 1.0f, 1.08883f };
-	float pM[9] = { 
-		 0.4124f, 0.3576f, 0.1805f,
-		 0.2126f, 0.7152f, 0.0722f,
-		 0.0193f, 0.1192f, 0.9504f,
-	};
-	float pMi[9] = {
-		 3.2406f,-1.5372f,-0.4986f,
-		-0.9689f, 1.8758f, 0.0415f,
-		 0.0557f, -0.2040, 1.0571f,
-	};
-	rc = cudaMemcpyToSymbolAsync(Lab_M, &pM, 9*sizeof(float), 0, cudaMemcpyHostToDevice,stream);
-	if (cudaSuccess != rc) throw "Unable to copy cielab chromacity matrix";
-	
-	rc = cudaMemcpyToSymbolAsync(Lab_Mi, &pMi, 9*sizeof(float), 0, cudaMemcpyHostToDevice,stream);
-	if (cudaSuccess != rc) throw "Unable to copy cielab inverted chromacity matrix";
-
-	rc = cudaMemcpyToSymbolAsync(Lab_W, &pW, sizeof(float3), 0, cudaMemcpyHostToDevice,stream);
-	if (cudaSuccess != rc) throw "Unable to copy cielab reference white";
-}
 
 __global__
-void f_ppm8_to_cielab(float3* out, size_t pitch_out, uchar3* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x);
-	int y = (blockIdx.y * blockDim.y + threadIdx.y);
-	if (x >= width || y >= height) return;
-	
-	uchar3 p8 = *RC(uchar3, in, pitch_in, x, y, width, height);
-	float3 RGB = make_float3(p8.x, p8.y, p8.z) / 255.0f;
-	
-	float3 rgb = make_float3(
-		RGB.x <= Lab_vi ? RGB.x / 12.92 : pow((RGB.x + 0.055)/1.055, 2.4),
-		RGB.y <= Lab_vi ? RGB.y / 12.92 : pow((RGB.y + 0.055)/1.055, 2.4),
-		RGB.z <= Lab_vi ? RGB.z / 12.92 : pow((RGB.z + 0.055)/1.055, 2.4)
-	);
-
-	float3 xyz = make_float3(
-		Lab_M[0] * rgb.x + Lab_M[1] * rgb.y + Lab_M[2] * rgb.z,
-		Lab_M[3] * rgb.x + Lab_M[4] * rgb.y + Lab_M[5] * rgb.z,
-		Lab_M[6] * rgb.x + Lab_M[7] * rgb.y + Lab_M[8] * rgb.z
-	);
-	float3 r = make_float3(
-		xyz.x / Lab_W.x,
-		xyz.y / Lab_W.y,
-		xyz.z / Lab_W.z
-	);
-	float3 f = make_float3(
-		r.x > Lab_e ? pow(r.x, 1.0f/3.0f) : (Lab_k * r.x + 16.0f) / 116.0f,
-		r.y > Lab_e ? pow(r.y, 1.0f/3.0f) : (Lab_k * r.y + 16.0f) / 116.0f,
-		r.z > Lab_e ? pow(r.z, 1.0f/3.0f) : (Lab_k * r.z + 16.0f) / 116.0f
-	);
-
-	float3 Lab = make_float3(
-			116.0f * f.y - 16.0f,
-			500.0f * (f.x - f.y),
-			200.0f * (f.y - f.z));
-
-	*RC(float3, out, pitch_out, x, y, width, height) = Lab;
-}
-
-__global__
-void f_cielab_to_ppm8(uchar3* out, size_t pitch_out, float3* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x);
-	int y = (blockIdx.y * blockDim.y + threadIdx.y);
-	if (x >= width || y >= height) return;
-	
-	float3 Lab = *RC(float3, in, pitch_in, x, y, width, height);
-	float3 f = make_float3(
-		(Lab.x+16.0f)/116.0f + Lab.y/500.0f,
-		(Lab.x+16.0f)/116.0f,
-	 	(Lab.x+16.0f)/116.0f - Lab.z/200.0f
-	);
-	float3 f3 = make_float3(
-		f.x * f.x * f.x,
-		f.y * f.y * f.y,
-		f.z * f.z * f.z
-	);
-	float3 r = make_float3(
-		f3.x > Lab_e ? f3.x : (116.0f * f.x - 16.0f)/Lab_k,
-		f3.y > Lab_e ? f3.y : (116.0f * f.y - 16.0f)/Lab_k,
-		f3.z > Lab_e ? f3.z : (116.0f * f.z - 16.0f)/Lab_k
-		//Lab.x > Lab_k*Lab_e ? f3.y : Lab.x/Lab_k
-	);
-	float3 xyz = make_float3(
-		r.x * Lab_W.x,
-		r.y * Lab_W.y,
-		r.z * Lab_W.z
-	);
-	float3 rgb = make_float3(
-		Lab_Mi[0] * xyz.x + Lab_Mi[1] * xyz.y + Lab_Mi[2] * xyz.z,
-		Lab_Mi[3] * xyz.x + Lab_Mi[4] * xyz.y + Lab_Mi[5] * xyz.z,
-		Lab_Mi[6] * xyz.x + Lab_Mi[7] * xyz.y + Lab_Mi[8] * xyz.z
-	);
-	float3 RGB = make_float3(
-		rgb.x <= Lab_v ? 12.92f * rgb.x : 1.055f * pow(rgb.x, 1.0f/2.4f) - 0.055,
-		rgb.y <= Lab_v ? 12.92f * rgb.y : 1.055f * pow(rgb.y, 1.0f/2.4f) - 0.055,
-		rgb.z <= Lab_v ? 12.92f * rgb.z : 1.055f * pow(rgb.z, 1.0f/2.4f) - 0.055
-	);
-	*RC(uchar3, out, pitch_out, x, y, width, height) = make_uchar3(
-			clamp(RGB.x, 0.0f, 1.0f) * 255,
-			clamp(RGB.y, 0.0f, 1.0f) * 255,
-			clamp(RGB.z, 0.0f, 1.0f) * 255);
-}
-__global__
-void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height)
+void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height, float angle)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 	
 	float3* px = RC(float3, lab, pitch_in, x, y, width, height);
-	px->x *= 0.6;
-	px->y *= 2;
-	px->z *= 2;
+
+	px->y = cos(angle)  * px->y + sin(angle) * px->z;
+	px->z = -sin(angle) * px->y + cos(angle) * px->z;
+	//px->x = 1.4;
 }
 
 __global__
@@ -239,8 +93,8 @@ void f_ppm8_sobel_mask(float3* out, size_t pitch_out, void* in, size_t pitch_in,
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 
-	auto d = View<float3>(out, pitch_out, x, y, width, height);
-	auto s = View<uchar3>(in, pitch_in, x, y, width, height);
+	auto d = View2DSym<float3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uchar3>(in, pitch_in, x, y, width, height);
 
 	float Kx[9] = {
 		+1, 0,-1,
@@ -308,7 +162,7 @@ void f_ppm8_blend(
 			(1-f.x) * vb.x / 255.0f,
 			(1-f.y) * vb.y / 255.0f,
 			(1-f.z) * vb.z / 255.0f);
-	float3 blend = ia+ib;
+	float3 blend = ia;
 
 	*RC(uchar3, out, pitch_out, x, y, width, height) = make_uchar3(blend.x*255, blend.y*255, blend.z*255);
 }
@@ -341,8 +195,8 @@ void f_pgm8_debayer_bilinear_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 	
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View<uint8_t>(in,  pitch_in,  x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in,  pitch_in,  x, y, width, height);
 
 	d(0,0) = make_uchar3(
 			(s( 0, 0 )), 
@@ -411,8 +265,8 @@ void f_pgm8_debayer_malvar_ppm8(void* out, size_t pitch_out, void* in, size_t pi
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
 	
 	int3 trr = make_int3(s(0,0), 0, 0), trg = make_int3(0, s(1,0), 0),
 	     tbg = make_int3(0, s(0,1), 0), tbb = make_int3(0, 0, s(1,1));
@@ -442,8 +296,8 @@ void f_pgm8_debayer_nn_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_
 	int y = (blockIdx.y * blockDim.y + threadIdx.y)*2;
 	if (x > width || y > height) return;
 
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
 
 	d(0,0) = make_uchar3(s(0,0), (s(1,0) + s(0,1)) >> 1, s(1,1));
 	d(1,0) = make_uchar3(s(2,0), (s(1,0) + s(2,1)) >> 1, s(1,1));
@@ -458,8 +312,8 @@ void f_pgm8_debayer_adams_gg_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 	
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
 	
 	// greens
 	d(0,0) = make_uchar3(0, 0, 0);
@@ -496,8 +350,8 @@ void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t 
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 	
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in,  x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
 	
 	d(0,0).x = (s(0,0));
 	d(0,0).z = (s(-1,-1)+s(1,-1)+s(-1,1)+s(1,1)) >> 2;
@@ -586,12 +440,12 @@ void f_pgm8_debayer_gunturk_gg1_ppm8(void* out, size_t pitch_out, void* in, size
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 
-	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in, x, y, width, height);
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
+	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in, x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
 	
 	float*h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
 
@@ -627,13 +481,13 @@ void f_pgm8_debayer_gunturk_gg2_ppm8(void* out, size_t pitch_out, void* in, size
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
 	if (x >= width || y >= height) return;
 
-	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto temp = View<float3>(gunturk_temp, gunturk_pitch, x, y, width, height);
-	auto s = View<uint8_t>(in, pitch_in, x, y, width, height);
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
+	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto temp = View2DSym<float3>(gunturk_temp, gunturk_pitch, x, y, width, height);
+	auto s = View2DSym<uint8_t>(in, pitch_in, x, y, width, height);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
 
 	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
 	
@@ -668,11 +522,11 @@ void f_pgm8_debayer_gunturk_rb1_ppm8(void* out, size_t pitch_out, void* in, size
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 
-	auto ca = &View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height)(0,0);
-	auto ch = &View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height)(0,0);
-	auto cv = &View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height)(0,0);
-	auto cd = &View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height)(0,0);
-	auto d = View<uchar3>(out, pitch_out, x, y, width, height);
+	auto ca = &View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height)(0,0);
+	auto ch = &View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height)(0,0);
+	auto cv = &View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height)(0,0);
+	auto cd = &View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height)(0,0);
+	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
 	
 	float *h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
 
@@ -704,12 +558,12 @@ void f_pgm8_debayer_gunturk_rb2_ppm8(void* out, size_t pitch_out, void* in, size
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
 	if (x >= width || y >= height) return;
 
-	auto ca = View<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto t = &View<float3>(gunturk_temp, gunturk_pitch, x, y, width, height)(0,0);
-	auto d = &View<uchar3>(out, pitch_out, x, y, width, height)(0,0);
+	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
+	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
+	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
+	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
+	auto t = &View2DSym<float3>(gunturk_temp, gunturk_pitch, x, y, width, height)(0,0);
+	auto d = &View2DSym<uchar3>(out, pitch_out, x, y, width, height)(0,0);
 
 	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
 	
@@ -840,30 +694,10 @@ int main(int /*argc*/, char** /*argv*/)
 		auto original = Image::load("kodak.ppm");
 		original->copyToDevice(stream);
 		original->printInfo();
+	
+		auto lab = Image::create(Image::lab, original->width, original->height);
+		original->toLab(lab, stream);
 
-		float3* cielab;
-		size_t cielab_pitch;
-		cudaMallocPitch(&cielab, &cielab_pitch, sizeof(float3) * original->width, original->height);
-		
-		setupCielab(stream);
-		f_ppm8_to_cielab<<<gridSize, blockSize, 0, stream>>>(
-				cielab, cielab_pitch, 
-				(uchar3*) original->mem.device.data,
-				original->mem.device.pitch,
-				original->width,
-				original->height
-		);
-#if 0	
-		f_cielab_enhance<<<gridSize, blockSize, 0, stream>>>(
-				cielab, cielab_pitch, original->width, original->height);
-		
-		f_cielab_to_ppm8<<<gridSize, blockSize, 0, stream>>>(
-				(uchar3*)original->mem.device.data, original->mem.device.pitch,
-				cielab, cielab_pitch,
-				original->width,
-				original->height
-		);
-#endif
 		auto bayer = Image::create(Image::Type::pgm, original->width, original->height);
 		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
 				bayer->mem.device.data,
@@ -1009,19 +843,18 @@ int main(int /*argc*/, char** /*argv*/)
 		debayer4->copyToHost(stream);
 
 		// GUNTURK / MALVAR
-		float3* mask;
-		size_t mask_pitch;
-		cudaMallocPitch(&mask, &mask_pitch, sizeof(float3) * original->width, original->height);
+		auto mask = Image::create(Image::Type::raw, original->width, original->height, 3, 32);
 
-		f_ppm8_sobel_mask<<<gridSize, blockSize, 0, stream>>>(
-				mask, mask_pitch,
-				debayer4->mem.device.data, debayer4->mem.device.pitch,
-				debayer4->width, debayer4->height);
+		SobelFilter sobel;
+		sobel.source = original,
+		sobel.destination = mask,
+		sobel.run(stream);
+
 		f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
 				(uchar3*)debayer5->mem.device.data, debayer5->mem.device.pitch,
 				(uchar3*)debayer2->mem.device.data, debayer2->mem.device.pitch,
 				(uchar3*)debayer4->mem.device.data, debayer4->mem.device.pitch,
-				mask, mask_pitch,
+				(float3*)mask->mem.device.data, mask->mem.device.pitch,
 				debayer5->width, debayer5->height);
 
 		debayer5->copyToHost(stream);
@@ -1043,17 +876,30 @@ int main(int /*argc*/, char** /*argv*/)
 
 
 		int i = 0;
-		int count = 8;
+		int count = 9;
 		int scale = 1;
 		int dx = 0, dy = 0;
-
-		Image* debayer[] = { bayer, bayer_colored, 
+		float angle = 0.04;
+		Image* debayer[] = { bayer, bayer_colored, original, 
 			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5 };
 		while (true)
 		{
+			f_cielab_enhance <<< gridSize, blockSize, 0, stream >>> (
+				(float3*)lab->mem.device.data, lab->mem.device.pitch,
+				lab->width, lab->height, angle
+			);
+			original->fromLab(lab, stream);
+		
+			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
+				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				(float3*)mask->mem.device.data, mask->mem.device.pitch,
+				original->width, original->height);
+			
 			if (!i)
 			{
-#if 1
+#if 0
 				f_pgm8<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
@@ -1068,10 +914,10 @@ int main(int /*argc*/, char** /*argv*/)
 				f_cielab<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
-					cielab,
-					cielab_pitch,
-					original->width,
-					original->height,
+					lab->mem.device.data,
+					lab->mem.device.pitch,
+					lab->width,
+					lab->height,
 					scale,
 					dx*scale, dy*scale
 				);
@@ -1126,6 +972,8 @@ int main(int /*argc*/, char** /*argv*/)
 					case '5':
 					case '6':
 					case '7':
+					case '8':
+					case '9':
 						  i = e - '0';
 						  break;
 					default: break;

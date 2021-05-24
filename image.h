@@ -1,9 +1,11 @@
 #pragma once
+#include <cuda_runtime.h>
+#include <operators.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
-#include <cuda_runtime.h>
+#include <math.h>
+#include <view.h>
 
 #if USE_NVJPEG 
 #include <nvjpeg.h>
@@ -16,6 +18,8 @@ public:
 	enum Type
 	{
 		unknown,
+		raw,
+		lab,
 		jpeg,
 		ppm,
 		pgm,
@@ -35,12 +39,14 @@ public:
 
 	~Image();
 
-	static Image* create(Type type, size_t width, size_t height, size_t bpp=8);
+	static Image* create(Type type, size_t width, size_t height, size_t channels = 0, size_t bpp=8);
 	static Image* load(const char* filename = nullptr);
 	static Image* save(const char* filename = nullptr);
 
 	void copyToDevice(cudaStream_t stream);
 	void copyToHost(cudaStream_t stream);
+	void toLab(Image* image, cudaStream_t stream);
+	void fromLab(Image* image, cudaStream_t stream);
 	void printInfo();
 
 	float sharpness8();

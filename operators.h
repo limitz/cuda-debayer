@@ -140,6 +140,10 @@ inline __host__ __device__ float3 make_float3(uint3 a)
 {
     return make_float3(float(a.x), float(a.y), float(a.z));
 }
+inline __host__ __device__ float3 make_float3(uchar3 a)
+{
+	return make_float3((float)a.x, (float)a.y, (float)a.z);
+}
 
 inline __host__ __device__ int3 make_int3(int s)
 {
