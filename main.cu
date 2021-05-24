@@ -67,6 +67,134 @@ public:
 	int y;
 };
 
+#define Lab_e 0.008856f
+#define Lab_k 903.3f
+#define Lab_v 0.0031308
+#define Lab_vi 0.04045
+
+__constant__ __device__ float Lab_M[9];
+__constant__ __device__ float Lab_Mi[9];
+__constant__ __device__ float3 Lab_W;
+
+void setupCielab(cudaStream_t stream)
+{
+	int rc;
+	float pW[3] = { 0.95047f, 1.0f, 1.08883f };
+	float pM[9] = { 
+		 0.4124f, 0.3576f, 0.1805f,
+		 0.2126f, 0.7152f, 0.0722f,
+		 0.0193f, 0.1192f, 0.9504f,
+	};
+	float pMi[9] = {
+		 3.2406f,-1.5372f,-0.4986f,
+		-0.9689f, 1.8758f, 0.0415f,
+		 0.0557f, -0.2040, 1.0571f,
+	};
+	rc = cudaMemcpyToSymbolAsync(Lab_M, &pM, 9*sizeof(float), 0, cudaMemcpyHostToDevice,stream);
+	if (cudaSuccess != rc) throw "Unable to copy cielab chromacity matrix";
+	
+	rc = cudaMemcpyToSymbolAsync(Lab_Mi, &pMi, 9*sizeof(float), 0, cudaMemcpyHostToDevice,stream);
+	if (cudaSuccess != rc) throw "Unable to copy cielab inverted chromacity matrix";
+
+	rc = cudaMemcpyToSymbolAsync(Lab_W, &pW, sizeof(float3), 0, cudaMemcpyHostToDevice,stream);
+	if (cudaSuccess != rc) throw "Unable to copy cielab reference white";
+}
+
+__global__
+void f_ppm8_to_cielab(float3* out, size_t pitch_out, uchar3* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+	
+	uchar3 p8 = *RC(uchar3, in, pitch_in, x, y, width, height);
+	float3 RGB = make_float3(p8.x, p8.y, p8.z) / 255.0f;
+	
+	float3 rgb = make_float3(
+		RGB.x <= Lab_vi ? RGB.x / 12.92 : pow((RGB.x + 0.055)/1.055, 2.4),
+		RGB.y <= Lab_vi ? RGB.y / 12.92 : pow((RGB.y + 0.055)/1.055, 2.4),
+		RGB.z <= Lab_vi ? RGB.z / 12.92 : pow((RGB.z + 0.055)/1.055, 2.4)
+	);
+
+	float3 xyz = make_float3(
+		Lab_M[0] * rgb.x + Lab_M[1] * rgb.y + Lab_M[2] * rgb.z,
+		Lab_M[3] * rgb.x + Lab_M[4] * rgb.y + Lab_M[5] * rgb.z,
+		Lab_M[6] * rgb.x + Lab_M[7] * rgb.y + Lab_M[8] * rgb.z
+	);
+	float3 r = make_float3(
+		xyz.x / Lab_W.x,
+		xyz.y / Lab_W.y,
+		xyz.z / Lab_W.z
+	);
+	float3 f = make_float3(
+		r.x > Lab_e ? pow(r.x, 1.0f/3.0f) : (Lab_k * r.x + 16.0f) / 116.0f,
+		r.y > Lab_e ? pow(r.y, 1.0f/3.0f) : (Lab_k * r.y + 16.0f) / 116.0f,
+		r.z > Lab_e ? pow(r.z, 1.0f/3.0f) : (Lab_k * r.z + 16.0f) / 116.0f
+	);
+
+	float3 Lab = make_float3(
+			116.0f * f.y - 16.0f,
+			500.0f * (f.x - f.y),
+			200.0f * (f.y - f.z));
+
+	*RC(float3, out, pitch_out, x, y, width, height) = Lab;
+}
+
+__global__
+void f_cielab_to_ppm8(uchar3* out, size_t pitch_out, float3* in, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+	
+	float3 Lab = *RC(float3, in, pitch_in, x, y, width, height);
+	float3 f = make_float3(
+		(Lab.x+16.0f)/116.0f + Lab.y/500.0f,
+		(Lab.x+16.0f)/116.0f,
+	 	(Lab.x+16.0f)/116.0f - Lab.z/200.0f
+	);
+	float3 f3 = make_float3(
+		f.x * f.x * f.x,
+		f.y * f.y * f.y,
+		f.z * f.z * f.z
+	);
+	float3 r = make_float3(
+		f3.x > Lab_e ? f3.x : (116.0f * f.x - 16.0f)/Lab_k,
+		f3.y > Lab_e ? f3.y : (116.0f * f.y - 16.0f)/Lab_k,
+		f3.z > Lab_e ? f3.z : (116.0f * f.z - 16.0f)/Lab_k
+		//Lab.x > Lab_k*Lab_e ? f3.y : Lab.x/Lab_k
+	);
+	float3 xyz = make_float3(
+		r.x * Lab_W.x,
+		r.y * Lab_W.y,
+		r.z * Lab_W.z
+	);
+	float3 rgb = make_float3(
+		Lab_Mi[0] * xyz.x + Lab_Mi[1] * xyz.y + Lab_Mi[2] * xyz.z,
+		Lab_Mi[3] * xyz.x + Lab_Mi[4] * xyz.y + Lab_Mi[5] * xyz.z,
+		Lab_Mi[6] * xyz.x + Lab_Mi[7] * xyz.y + Lab_Mi[8] * xyz.z
+	);
+	float3 RGB = make_float3(
+		rgb.x <= Lab_v ? 12.92f * rgb.x : 1.055f * pow(rgb.x, 1.0f/2.4f) - 0.055,
+		rgb.y <= Lab_v ? 12.92f * rgb.y : 1.055f * pow(rgb.y, 1.0f/2.4f) - 0.055,
+		rgb.z <= Lab_v ? 12.92f * rgb.z : 1.055f * pow(rgb.z, 1.0f/2.4f) - 0.055
+	);
+	*RC(uchar3, out, pitch_out, x, y, width, height) = make_uchar3(
+			clamp(RGB.x, 0.0f, 1.0f) * 255,
+			clamp(RGB.y, 0.0f, 1.0f) * 255,
+			clamp(RGB.z, 0.0f, 1.0f) * 255);
+}
+__global__
+void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+	
+	float3* px = RC(float3, lab, pitch_in, x, y, width, height);
+	px->x *= 1.2;
+}
+
 __global__
 void f_pgm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale, int dx, int dy)
 {
@@ -612,10 +740,32 @@ int main(int /*argc*/, char** /*argv*/)
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
-
 		auto original = Image::load("castle.ppm");
 		original->copyToDevice(stream);
 		original->printInfo();
+
+		float3* cielab;
+		size_t cielab_pitch;
+		cudaMallocPitch(&cielab, &cielab_pitch, sizeof(float3) * original->width, original->height);
+		
+		setupCielab(stream);
+		f_ppm8_to_cielab<<<gridSize, blockSize, 0, stream>>>(
+				cielab, cielab_pitch, 
+				(uchar3*) original->mem.device.data,
+				original->mem.device.pitch,
+				original->width,
+				original->height
+		);
+		
+		f_cielab_enhance<<<gridSize, blockSize, 0, stream>>>(
+				cielab, cielab_pitch, original->width, original->height);
+		
+		f_cielab_to_ppm8<<<gridSize, blockSize, 0, stream>>>(
+				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				cielab, cielab_pitch,
+				original->width,
+				original->height
+		);
 
 		auto bayer = Image::create(Image::Type::pgm, original->width, original->height);
 		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
@@ -784,6 +934,7 @@ int main(int /*argc*/, char** /*argv*/)
 		{
 			if (!i)
 			{
+#if 0
 				f_pgm8<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
@@ -794,6 +945,18 @@ int main(int /*argc*/, char** /*argv*/)
 					scale,
 					dx*scale, dy*scale
 				);
+#endif
+				f_ppm8<<<gridSize, blockSize, 0, stream>>>(
+					display.CUDA.frame.data,
+					display.CUDA.frame.pitch,
+					original->mem.device.data,
+					original->mem.device.pitch,
+					original->width,
+					original->height,
+					scale,
+					dx*scale, dy*scale
+				);
+
 			}
 			else
 			{
