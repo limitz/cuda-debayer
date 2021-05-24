@@ -192,7 +192,7 @@ void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height)
 	if (x >= width || y >= height) return;
 	
 	float3* px = RC(float3, lab, pitch_in, x, y, width, height);
-	px->x *= 1.2;
+	px->x *= 1;
 }
 
 __global__
@@ -216,6 +216,20 @@ void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t wid
 	*RC(float4, out, pitch_out, x, y, width, height) = make_float4(p.x/255.0f, p.y/255.0f, p.z/255.0f, 1.0);
 }
 
+__global__
+void f_cielab(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale, int dx, int dy)
+{
+	int x = (blockIdx.x * blockDim.x + threadIdx.x);
+	int y = (blockIdx.y * blockDim.y + threadIdx.y);
+	if (x >= width || y >= height) return;
+
+	float3 p = clamp(*RC(float3, in, pitch_in, x/scale+dx, y/scale+dy, width, height)/100, -1.0f, 1.0f);
+	float sat = clamp(sqrt(p.y * p.y + p.z * p.z), 0.0f, 1.0f);
+	*RC(float4, out, pitch_out, x, y, width, height) = make_float4(
+			p.x + p.y + p.z/2,
+			p.x - p.y + p.z/2, 
+			p.x - p.z, 1.0);
+}
 __global__
 void f_ppm8_bayer_pgm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
 {
@@ -740,7 +754,7 @@ int main(int /*argc*/, char** /*argv*/)
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
-		auto original = Image::load("castle.ppm");
+		auto original = Image::load("kodak.ppm");
 		original->copyToDevice(stream);
 		original->printInfo();
 
@@ -785,6 +799,15 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+#if 0
+		f_ppm8_to_cielab<<<gridSize, blockSize, 0, stream>>>(
+				cielab, cielab_pitch, 
+				(uchar3*) bayer_colored->mem.device.data,
+				bayer_colored->mem.device.pitch,
+				bayer_colored->width,
+				bayer_colored->height
+		);
+#endif
 		setupMalvar(stream);
 		auto debayer0 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer1 = Image::create(Image::Type::ppm, original->width, original->height);
@@ -946,11 +969,11 @@ int main(int /*argc*/, char** /*argv*/)
 					dx*scale, dy*scale
 				);
 #endif
-				f_ppm8<<<gridSize, blockSize, 0, stream>>>(
+				f_cielab<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
-					original->mem.device.data,
-					original->mem.device.pitch,
+					cielab,
+					cielab_pitch,
 					original->width,
 					original->height,
 					scale,
