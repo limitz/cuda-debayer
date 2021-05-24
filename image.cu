@@ -187,6 +187,7 @@ void Image::copyToDevice(cudaStream_t stream)
 
 void Image::toLab(Image* image, cudaStream_t stream)
 {
+	printInfo();
 	image->printInfo();
 	if (!image) throw "Image is null";
 	if (image->width != width || image->height != height) 

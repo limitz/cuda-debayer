@@ -38,7 +38,7 @@ __constant__ __device__ float3 Lab_W;
 
 
 __global__
-void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height, float angle)
+void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height, float angle, float sat, float bri)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
@@ -48,7 +48,9 @@ void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height,
 
 	px->y = cos(angle)  * px->y + sin(angle) * px->z;
 	px->z = -sin(angle) * px->y + cos(angle) * px->z;
-	//px->x = 1.4;
+	px->x *= bri;
+	px->y *= sat;
+	px->z *= sat;
 }
 
 __global__
@@ -162,7 +164,7 @@ void f_ppm8_blend(
 			(1-f.x) * vb.x / 255.0f,
 			(1-f.y) * vb.y / 255.0f,
 			(1-f.z) * vb.z / 255.0f);
-	float3 blend = ia;
+	float3 blend = ia + ib;
 
 	*RC(uchar3, out, pitch_out, x, y, width, height) = make_uchar3(blend.x*255, blend.y*255, blend.z*255);
 }
@@ -732,7 +734,9 @@ int main(int /*argc*/, char** /*argv*/)
 		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer4 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer5 = Image::create(Image::Type::ppm, original->width, original->height);
-
+		auto black = Image::create(Image::Type::ppm, original->width, original->height);
+		auto funky1 = Image::create(Image::Type::ppm, original->width, original->height);
+		auto funky2 = Image::create(Image::Type::ppm, original->width, original->height);
 		// NEAREST NEIGHBOR
 		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer0->mem.device.data,
@@ -795,6 +799,7 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+#if 0
 		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer4->mem.device.data,
 				debayer4->mem.device.pitch,
@@ -803,6 +808,7 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
+#endif
 		f_pgm8_debayer_gunturk_gg1_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer4->mem.device.data,
 				debayer4->mem.device.pitch,
@@ -820,7 +826,7 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
-		for (int i=0; i<8; i++)
+		for (int i=0; i<24; i++)
 		{
 			f_pgm8_debayer_gunturk_rb1_ppm8<<<gridSize, blockSize, 0, stream>>>(	
 				debayer4->mem.device.data,
@@ -846,8 +852,10 @@ int main(int /*argc*/, char** /*argv*/)
 		auto mask = Image::create(Image::Type::raw, original->width, original->height, 3, 32);
 
 		SobelFilter sobel;
-		sobel.source = original,
-		sobel.destination = mask,
+		sobel.source = original;
+		sobel.destination = mask;
+		sobel.avgChannels = false;
+		sobel.power = 0.5;
 		sobel.run(stream);
 
 		f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
@@ -876,24 +884,36 @@ int main(int /*argc*/, char** /*argv*/)
 
 
 		int i = 0;
-		int count = 9;
+		int count = 10;
 		int scale = 1;
 		int dx = 0, dy = 0;
 		float angle = 0.04;
-		Image* debayer[] = { bayer, bayer_colored, original, 
+		float sat= 1, bri=1;
+		Image* debayer[] = { bayer, bayer_colored, funky1, funky2,
 			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5 };
 		while (true)
 		{
+			sobel.run(stream);
+
 			f_cielab_enhance <<< gridSize, blockSize, 0, stream >>> (
 				(float3*)lab->mem.device.data, lab->mem.device.pitch,
-				lab->width, lab->height, angle
+				lab->width, lab->height, angle, sat, bri
 			);
+			sat=1;
+			bri=1;
 			original->fromLab(lab, stream);
 		
 			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
+				(uchar3*)funky1->mem.device.data, funky1->mem.device.pitch,
+				(uchar3*)black->mem.device.data, black->mem.device.pitch,
 				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				(float3*)mask->mem.device.data, mask->mem.device.pitch,
+				original->width, original->height);
+			
+			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
+				(uchar3*)funky2->mem.device.data, funky2->mem.device.pitch,
 				(uchar3*)original->mem.device.data, original->mem.device.pitch,
-				(uchar3*)original->mem.device.data, original->mem.device.pitch,
+				(uchar3*)black->mem.device.data, black->mem.device.pitch,
 				(float3*)mask->mem.device.data, mask->mem.device.pitch,
 				original->width, original->height);
 			
@@ -945,6 +965,7 @@ int main(int /*argc*/, char** /*argv*/)
 			rc = cudaGetLastError();
 			if (cudaSuccess != rc) throw "CUDA ERROR";
 
+			Image* img;
 			// check escape pressed
 			if (int e = display.events()) 
 			{
@@ -964,6 +985,29 @@ int main(int /*argc*/, char** /*argv*/)
 					case 's': dy-=10; break;
 					case 'a': dx+=10; break;
 					case 'd': dx-=10; break;
+					case 'z': sobel.power *= 0.8; break;
+					case 'x': sobel.power /= 0.8; break;
+					case 'c': sobel.avgChannels = !sobel.avgChannels; break;
+					case '[': bri = 1.1f; break;
+					case ']': bri = 1.0f/1.1f; break;
+					case ';': sat = 1.1f; break;
+					case '\'':sat = 1.0f/1.1f; break;
+					case 'v': 
+						img = Image::load("castle.ppm");
+						img->printInfo();
+						img->copyToDevice(stream);
+						img->toLab(lab, stream);
+						cudaStreamSynchronize(stream);
+						delete img;
+						break;
+					case 'b': 
+						img = Image::load("sheep.ppm");
+						img->printInfo();
+						img->copyToDevice(stream);
+						img->toLab(lab, stream);
+						cudaStreamSynchronize(stream);
+						delete img;
+						break;
 					case '0': 
 					case '1':
 					case '2':
