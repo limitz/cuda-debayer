@@ -242,40 +242,28 @@ void f_ppm8_sobel_mask(float3* out, size_t pitch_out, void* in, size_t pitch_in,
 	auto d = View<float3>(out, pitch_out, x, y, width, height);
 	auto s = View<uchar3>(in, pitch_in, x, y, width, height);
 
-	float Kg[25] = {
-		-2,+2, 0,+2,-2,
-		+2,-2, 0,-2,+2,
-		 0, 0, 0, 0, 0,
-		+2,-2, 0,-2,+2,
-		-2,+2, 0,+2,-2
-	}; 
-	float Kx[25] = {
-		 0,+0, 0,-0,-0,
-		 0,+2, 0,-2,-0,
-		 0,+3, 0,-3,-0,
-		 0,+2, 0,-2,-0,
-		 0,+0, 0,-0,-0
+	float Kx[9] = {
+		+1, 0,-1,
+		+2, 0,-2,
+		+1, 0,-1,
 	};
-	float Ky[25] = {
-		+0,+0,+0,+0,+0,
-		+0,+2,+3,+2,+0,
-		 0, 0, 0, 0, 0,
-		-0,-2,-3,-0,-0,
-		-0,-0,-0,-0,-0
+	float Ky[9] = {
+		+1,+2,+1,
+		 0, 0, 0,
+		-1,-2,-1,
 	};
 
 	float3 Lx = make_float3(0,0,0);
 	float3 Ly = make_float3(0,0,0);
 
 	#pragma unroll
-	for (int r=-2, i=0; r<3; r++, i++)
+	for (int r=-1, i=0; r<2; r++, i++)
 	{
 		#pragma unroll
-		for (int c=-2, j=0; c<3; c++, j++)
+		for (int c=-1, j=0; c<2; c++, j++)
 		{
-			float  fg = Kg[i*5+j]/255.0;
-			float  fx = Kg[i*5+j]/255.0;
-			float  fy = Kg[i*5+j]/255.0;
+			float  fx = Kx[i*3+j]/255.0;
+			float  fy = Ky[i*3+j]/255.0;
 			uchar3 ux = s(c,r);
 			uchar3 uy = s(c,r);
 			Lx.x += fx * ux.x;
@@ -286,11 +274,13 @@ void f_ppm8_sobel_mask(float3* out, size_t pitch_out, void* in, size_t pitch_in,
 			Ly.z += fy * uy.z;
 		}
 	}
-	
+#if 1
+	Lx.x = Lx.y = Lx.z = (Lx.x+Lx.y+Lx.z)/3;
+#endif
 	float3 Lg = clamp(make_float3(
-			sqrt(Lx.x*Lx.x + Ly.x*Ly.x),
-			sqrt(Lx.y*Lx.y + Ly.y*Ly.y),
-			sqrt(Lx.z*Lx.z + Ly.z*Ly.z)
+			pow(Lx.x*Lx.x + Ly.x*Ly.x, 0.5),
+			pow(Lx.y*Lx.y + Ly.y*Ly.y, 0.5),
+			pow(Lx.z*Lx.z + Ly.z*Ly.z, 0.5)
 			), 0.0f, 1.0f);
 	d(0,0) = Lg;
 }
