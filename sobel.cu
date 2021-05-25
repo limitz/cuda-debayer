@@ -91,8 +91,6 @@ void SobelFilter::run(cudaStream_t stream)
 	if (source->width != destination->width || source->height != destination->height) 
 		throw "Images not the same size";
 	
-	source->printInfo();
-
 	dim3 gridSize = {
 		(((int)source->width  + blockSize.x - 1) / blockSize.x),
 		(((int)source->height + blockSize.y - 1) / blockSize.y)

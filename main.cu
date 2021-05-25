@@ -15,6 +15,7 @@
 #include <operators.h>
 #include <image.h>
 #include <sobel.h>
+#include <pronk.h>
 #include <view.h>
 
 #ifndef TITLE
@@ -38,7 +39,7 @@ __constant__ __device__ float3 Lab_W;
 
 
 __global__
-void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height, float angle, float sat, float bri)
+void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height, float angle, float sat, float bri, float ofs, float da, float db)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
@@ -49,8 +50,11 @@ void f_cielab_enhance(float3* lab, size_t pitch_in, size_t width, size_t height,
 	px->y = cos(angle)  * px->y + sin(angle) * px->z;
 	px->z = -sin(angle) * px->y + cos(angle) * px->z;
 	px->x *= bri;
+	px->x += ofs;
 	px->y *= sat;
 	px->z *= sat;
+	px->y += da;
+	px->z += db;
 }
 
 __global__
@@ -75,7 +79,7 @@ void f_ppm8(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t wid
 }
 
 __global__
-void f_cielab(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale, int dx, int dy)
+void f_cielab(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, size_t scale, int dx, int dy, bool l_only, bool s_only)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x);
 	int y = (blockIdx.y * blockDim.y + threadIdx.y);
@@ -84,9 +88,9 @@ void f_cielab(float4* out, size_t pitch_out, void* in, size_t pitch_in, size_t w
 	float3 p = clamp(*RC(float3, in, pitch_in, x/scale+dx, y/scale+dy, width, height)/100, -1.0f, 1.0f);
 	float sat = clamp(sqrt(p.y * p.y + p.z * p.z), 0.0f, 1.0f);
 	*RC(float4, out, pitch_out, x, y, width, height) = make_float4(
-			p.x + p.y + p.z/2,
-			p.x - p.y + p.z/2, 
-			p.x - p.z, 1.0);
+			l_only ? p.x : s_only ?  p.y + p.z/2 : p.x + p.y + p.z/2,
+			l_only ? p.x : s_only ? -p.y + p.z/2 : p.x - p.y + p.z/2,
+			l_only ? p.x : s_only ? -p.z : p.x - p.z, 1.0);
 }
 __global__
 void f_ppm8_sobel_mask(float3* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
@@ -728,6 +732,8 @@ int main(int /*argc*/, char** /*argv*/)
 		);
 #endif
 		setupMalvar(stream);
+		auto debayer_lab = Image::create(Image::Type::lab, original->width, original->height);
+
 		auto debayer0 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer1 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer2 = Image::create(Image::Type::ppm, original->width, original->height);
@@ -737,6 +743,13 @@ int main(int /*argc*/, char** /*argv*/)
 		auto black = Image::create(Image::Type::ppm, original->width, original->height);
 		auto funky1 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto funky2 = Image::create(Image::Type::ppm, original->width, original->height);
+		
+		for (int i=0; i<black->width * black->height * black->channels; i++)
+		{
+			((uint8_t*)black->mem.host.data)[i] = 0x11;
+		}
+		black->copyToDevice(stream);
+
 		// NEAREST NEIGHBOR
 		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
 				debayer0->mem.device.data,
@@ -858,6 +871,11 @@ int main(int /*argc*/, char** /*argv*/)
 		sobel.power = 0.5;
 		sobel.run(stream);
 
+		PronkFilter pronk;
+		pronk.source = bayer;
+		pronk.destination = debayer_lab;
+		pronk.run(stream);
+
 		f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
 				(uchar3*)debayer5->mem.device.data, debayer5->mem.device.pitch,
 				(uchar3*)debayer2->mem.device.data, debayer2->mem.device.pitch,
@@ -887,8 +905,12 @@ int main(int /*argc*/, char** /*argv*/)
 		int count = 10;
 		int scale = 1;
 		int dx = 0, dy = 0;
-		float angle = 0.04;
+		float ofs = 0;
+		float angle = 0.00;
 		float sat= 1, bri=1;
+		float da=0, db=0;
+		bool s_only = false, l_only = false;
+		bool order = false;
 		Image* debayer[] = { bayer, bayer_colored, funky1, funky2,
 			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5 };
 		while (true)
@@ -896,24 +918,31 @@ int main(int /*argc*/, char** /*argv*/)
 			sobel.run(stream);
 
 			f_cielab_enhance <<< gridSize, blockSize, 0, stream >>> (
-				(float3*)lab->mem.device.data, lab->mem.device.pitch,
-				lab->width, lab->height, angle, sat, bri
+				(float3*)debayer_lab->mem.device.data, debayer_lab->mem.device.pitch,
+				debayer_lab->width, debayer_lab->height, angle, sat, bri, ofs, da, db
 			);
 			sat=1;
 			bri=1;
-			original->fromLab(lab, stream);
-		
+			ofs=0;
+			da=0;
+			db=0;
+			original->fromLab(debayer_lab, stream);
+	
+			
 			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
 				(uchar3*)funky1->mem.device.data, funky1->mem.device.pitch,
-				(uchar3*)black->mem.device.data, black->mem.device.pitch,
+				(uchar3*)original->mem.device.data, original->mem.device.pitch,
 				(uchar3*)original->mem.device.data, original->mem.device.pitch,
 				(float3*)mask->mem.device.data, mask->mem.device.pitch,
 				original->width, original->height);
 			
+			Image* d1 = order ? black : original;
+			Image* d2 = order ? original : black;
+
 			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
 				(uchar3*)funky2->mem.device.data, funky2->mem.device.pitch,
-				(uchar3*)original->mem.device.data, original->mem.device.pitch,
-				(uchar3*)black->mem.device.data, black->mem.device.pitch,
+				(uchar3*)d1->mem.device.data, black->mem.device.pitch,
+				(uchar3*)d2->mem.device.data, original->mem.device.pitch,
 				(float3*)mask->mem.device.data, mask->mem.device.pitch,
 				original->width, original->height);
 			
@@ -934,12 +963,13 @@ int main(int /*argc*/, char** /*argv*/)
 				f_cielab<<<gridSize, blockSize, 0, stream>>>(
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
-					lab->mem.device.data,
-					lab->mem.device.pitch,
-					lab->width,
-					lab->height,
+					debayer_lab->mem.device.data,
+					debayer_lab->mem.device.pitch,
+					debayer_lab->width,
+					debayer_lab->height,
 					scale,
-					dx*scale, dy*scale
+					dx*scale, dy*scale,
+					l_only, s_only
 				);
 #endif
 			}
@@ -1007,6 +1037,33 @@ int main(int /*argc*/, char** /*argv*/)
 						img->toLab(lab, stream);
 						cudaStreamSynchronize(stream);
 						delete img;
+						break;
+					case 'n':
+						ofs = 10;
+						break;
+					case 'm':
+						ofs = -10;
+						break;
+					case 'h':
+						da = 5;
+						break;
+					case 'j':
+						da = -5;
+						break;
+					case 'y':
+						db = 5;
+						break;
+					case 'u':
+						db = -5;
+						break;
+					case 'i':
+						l_only = !l_only;
+						break;
+					case 'o':
+						s_only = !s_only;
+						break;
+					case 'p':
+						order = !order;
 						break;
 					case '0': 
 					case '1':

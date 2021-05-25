@@ -6,3 +6,4 @@ program
 *.onnx
 *.engine
 *.caffemodel
+*.template
