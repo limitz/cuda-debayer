@@ -6,8 +6,8 @@
 #include <math.h>
 #include <sys/stat.h>
 
-#define WIDTH 1920
-#define HEIGHT 1080
+#define WIDTH 3840
+#define HEIGHT 2160
 
 #include <display.h>
 #include <pthread.h>
@@ -697,7 +697,7 @@ int main(int /*argc*/, char** /*argv*/)
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
-		auto original = Image::load("kodak.ppm");
+		auto original = Image::load("testimages.ppm");
 		original->copyToDevice(stream);
 		original->printInfo();
 	
