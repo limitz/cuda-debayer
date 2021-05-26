@@ -37,7 +37,7 @@ void f_hamilton_gg(void* out, size_t pitch_out, void* in, size_t pitch_in, size_
 }
 
 __global__
-void f_hamilton_rb(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height, int threshold)
+void f_hamilton_rb(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
@@ -48,26 +48,12 @@ void f_hamilton_rb(void* out, size_t pitch_out, void* in, size_t pitch_in, size_
 	
 	d(0,0).x = (s(0,0));
 	d(0,0).z = (s(-1,-1)+s(1,-1)+s(-1,1)+s(1,1)) >> 2;
-	d(0,1) = make_uchar3(0, s(0,1), 0);
-	d(1,1) = make_uchar3(0, 0, 0);
-
-	#pragma unroll
-	for (int i=0; i<2; i++)
-	{
-		float green;
-		int dh = abs(s(i-1,i)-s(i+1,i))+abs(2*s(i,i)-s(i+2,i)-s(i-2,i));
-		int dv = abs(s(i,i-1)-s(i,i+1))+abs(2*s(i,i)-s(i,i+2)-s(i,i-2));
-		
-		if (dh > dv+threshold) 
-			green = (s(i,i-1)+s(i,i+1))*0.5f+(2*s(i,i)-s(i,i-2)-s(i,i+2))*0.25f;
-		else if (dv > dh+threshold) 
-			green = (s(i-1,i)+s(i+1,i))*0.5f+(2*s(i,i)-s(i-2,i)-s(i+2,i))*0.25f;
-		else
-			green = (s(i,i-1)+s(i,i+1)+s(i-1,i)+s(i+1,i))*0.25f 
-			      + (4*s(i,i)-s(i,i-2)-s(i,i+2)-s(i-2,i)-s(i+2,i))*0.125f;
-
-		d(i,i).y = (uint8_t) clamp(green, 0.0f, 255.0f);
-	}
+	d(1,1).x = (s( 0, 0)+s(2, 0)+s( 0,2)+s(2,2)) >> 2;
+	d(1,1).z = (s(1,1));
+	d(1,0).x = (s( 0, 0)+s(2, 0)) >> 1;
+	d(1,0).z = (s( 1,-1)+s(1, 1)) >> 1;
+	d(0,1).x = (s( 0, 0)+s(0, 2)) >> 1;
+	d(0,1).z = (s(-1, 1)+s(1, 1)) >> 1;
 }
 
 void HamiltonFilter::run(cudaStream_t stream)
@@ -89,6 +75,5 @@ void HamiltonFilter::run(cudaStream_t stream)
 		source->mem.device.data,
 		source->mem.device.pitch,
 		source->width,
-		source->height,
-		threshold);
+		source->height);
 }
