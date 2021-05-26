@@ -6,13 +6,13 @@
 __device__
 static inline float L(float3 rgb)
 {
-	return 120 * (rgb.x + rgb.y + rgb.z) / 3.0f;
+	return 100 * sqrt( 0.299*rgb.x*rgb.x + 0.587*rgb.y*rgb.y + 0.114*rgb.z*rgb.z );
 }
 
 __device__
 static inline float A(float3 rgb)
 {
-	return 80 * (rgb.x - rgb.y);
+	return 90 * (rgb.x - rgb.y);
 }
 
 __device__
@@ -45,7 +45,7 @@ void f_pronk(float3* dst, size_t dst_pitch, uint8_t* src, size_t src_pitch, size
 }
 
 __global__
-void f_pronk_y(float3* dst, size_t dst_pitch, uint8_t* src, size_t src_pitch, size_t width, size_t height)
+void f_pronk_y(float3* dst, size_t dst_pitch, uint8_t* src, size_t src_pitch, size_t width, size_t height, float sharpness)
 {
 	int x = (blockIdx.x * blockDim.x + threadIdx.x)*2;
 	int y = (blockIdx.y * blockDim.y + threadIdx.y)*2;
@@ -54,41 +54,41 @@ void f_pronk_y(float3* dst, size_t dst_pitch, uint8_t* src, size_t src_pitch, si
 	auto d = View2DSym<float3> (dst, dst_pitch, x, y, width, height);
 	auto s = View2DSym<uint8_t>(src, src_pitch, x, y, width, height);
 
-	float v1 = (s(0,0) - 0.25f * (s(-2, 0) + s(2, 0) + s( 0,-2) + s(0, 2)))/2;
-	float v2 = (s(1,1) - 0.25f * (s(-1, 1) + s(3, 1) + s( 1,-1) + s(1, 3)))/2;
-	float v3 = (s(1,0) - 0.25f * (s(-1, 0) + s(3, 0) + s( 1,-2) + s(1, 2)))/2;
-	float v4 = (s(0,1) - 0.25f * (s(-2, 1) + s(2, 1) + s( 0,-1) + s(0, 3)))/2;
+	float v1 = (s(0,0) - 0.25f * (s(-2, 0) + s(2, 0) + s( 0,-2) + s(0, 2)))*sharpness;
+	float v2 = (s(1,1) - 0.25f * (s(-1, 1) + s(3, 1) + s( 1,-1) + s(1, 3)))*sharpness;
+	float v3 = (s(1,0) - 0.25f * (s(-1, 0) + s(3, 0) + s( 1,-2) + s(1, 2)))*sharpness;
+	float v4 = (s(0,1) - 0.25f * (s(-2, 1) + s(2, 1) + s( 0,-1) + s(0, 3)))*sharpness;
 	
 	float3 rgbr = clamp(make_float3(
-		+v1+s(0,0),
-		+v1+0.25f * (s(-1, 0) + s(1, 0) + s( 0,-1) + s(1, 0)),
-		+v1+0.25f * (s(-1,-1) + s(1,-1) + s(-1, 1) + s(1, 1))),
+		s(0,0),
+		0.25f * (s(-1, 0) + s(1, 0) + s( 0,-1) + s(1, 0)),
+		0.25f * (s(-1,-1) + s(1,-1) + s(-1, 1) + s(1, 1))),
 		0.0f, 255.0f
 	);
 	float3 rgbb = clamp(make_float3(
-		+v2+0.25f * (s(0,0) + s(2,0) + s(0,2) + s(2,2)),
-		+v2+0.25f * (s(0,1) + s(2,1) + s(1,0) + s(1,2)),
-		+v2+s(1,1)),
+		0.25f * (s(0,0) + s(2,0) + s(0,2) + s(2,2)),
+		0.25f * (s(0,1) + s(2,1) + s(1,0) + s(1,2)),
+		s(1,1)),
 		0.0f, 255.0f
 	);
 
 	float3 rgbrg = clamp(make_float3(
-		+v3+0.5f * (s(0, 0) + s(2, 0)),
-		+v3+s(1,0) ,
-		+v3+0.5f * (s(1,-1) + s(1, 1))),
+		0.5f * (s(0, 0) + s(2, 0)),
+		s(1,0) ,
+		0.5f * (s(1,-1) + s(1, 1))),
 		0.0f, 255.0f
 	);
 	float3 rgbbg = clamp(make_float3(
-		+v4+0.5f * (s(0, 0) + s(0, 2)),
-		+v4+s(0,1),
-		+v4+0.5f * (s(-1,1) + s(1, 1))),
+		0.5f * (s(0, 0) + s(0, 2)),
+		s(0,1),
+		0.5f * (s(-1,1) + s(1, 1))),
 		0.0f, 255.0f
 	);
 
-	float3 Lr = Lab(rgbr / 255.0);
-	float3 Lb = Lab(rgbb / 255.0);
-	float3 Lrg = Lab(rgbrg / 255.0);
-	float3 Lbg = Lab(rgbbg / 255.0);
+	float3 Lr = Lab(v1+rgbr / 255.0);
+	float3 Lb = Lab(v2+rgbb / 255.0);
+	float3 Lrg = Lab(v3+rgbrg / 255.0);
+	float3 Lbg = Lab(v4+rgbbg / 255.0);
 
 	Lr  = make_float3(v1/5+Lr.x,  Lr.y,  Lr.z);
 	Lb  = make_float3(v2/5+Lb.x,  Lb.y,  Lb.z);
@@ -126,7 +126,7 @@ void PronkFilter::run(cudaStream_t stream)
 	f_pronk_y <<< gridSizeQ, blockSize, 0, stream >>> (
 		(float3*)imm->mem.device.data, imm->mem.device.pitch,
 		(uint8_t*)source->mem.device.data, source->mem.device.pitch,
-		source->width, source->height);
+		source->width, source->height, sharpness);
 
 	destination->fromLab(imm, stream);
 	delete imm;

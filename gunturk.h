@@ -11,5 +11,4 @@ public:
 	virtual void run(cudaStream_t stream) override;
 	
 	size_t iterations = 8;
-	Filter backend = HamiltonFilter();
 };

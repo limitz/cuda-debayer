@@ -97,7 +97,6 @@ void f_gunturk_gg1(uchar3* out, size_t pitch_out, uint8_t* in, size_t pitch_in, 
 	ca(1,0) = ch(1,0) = cv(1,0) = cd(1,0) = make_float3(0,0,0); 
 	ca(1,1) = ch(1,1) = cv(1,1) = cd(1,1) = make_float3(0,0,0); 
 
-	#pragma unroll
 	for (int r=-2; r<4; r+=2)
 	{
 		#pragma unroll
@@ -136,7 +135,6 @@ void f_gunturk_gg2(uchar3* out, size_t pitch_out, uint8_t* in, size_t pitch_in, 
 	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
 	temp(0,0) =  temp(1,0) = temp(0,1) = temp(1,1) = make_float3(0,0,0);
 
-	#pragma unroll
 	for (int r=-4; r<6; r+=2)
 	{
 		#pragma unroll
@@ -176,7 +174,6 @@ void f_gunturk_rb1(uchar3* out, size_t pitch_out, uint8_t* in, size_t pitch_in, 
 
 	*ca = *ch = *cv = *cd = make_float3(0,0,0); 
 	
-	#pragma unroll
 	for (int r=-1; r<2; r++)
 	{
 		#pragma unroll
@@ -213,7 +210,6 @@ void f_gunturk_rb2(void* out, size_t pitch_out, void* in, size_t pitch_in, size_
 	
 	*t = make_float3(0,0,0);
 	
-	#pragma unroll
 	for (int r=-2; r<3; r++)
 	{
 		#pragma unroll
@@ -234,10 +230,12 @@ void GunturkFilter::run(cudaStream_t stream)
 {
 	Filter::run(stream);
 
+	HamiltonFilter backend;
 	backend.source = source;
 	backend.destination = destination;
 	backend.run(stream);
-		
+	
+	
 	f_gunturk_gg1 <<< gridSizeQ, blockSize, 0, stream >>> (
 		(uchar3*) destination->mem.device.data,
 		destination->mem.device.pitch,
@@ -273,4 +271,5 @@ void GunturkFilter::run(cudaStream_t stream)
 			source->width,
 			source->height);
 	}
+	
 }
