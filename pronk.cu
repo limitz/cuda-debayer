@@ -101,32 +101,18 @@ void f_pronk_y(float3* dst, size_t dst_pitch, uint8_t* src, size_t src_pitch, si
 	d(0,1) = Lbg; 
 }
 
-PronkFilter::PronkFilter()
-{
-	blockSize = { 16,16 };
-	int rc;
-
-	//rc = cudaMemcpyToSymbol(sobel_kernel_x, &kx, 9*sizeof(float), 0, cudaMemcpyHostToDevice);
-	//if (cudaSuccess != rc) throw "Unable to copy kernel x to device";
-
-	cudaDeviceSynchronize();
-}
-
-PronkFilter::~PronkFilter()
-{
-}
-
 void PronkFilter::run(cudaStream_t stream)
 {
-	
-	if (!source) throw "Source not set";
-	if (!destination) throw "Destination not set";
+	Filter::run(stream);
+
+	auto imm = Image::create(Image::Type::lab, source->width, source->height);
+
 	if (source->width != destination->width || source->height != destination->height) 
 		throw "Images not the same size";
 	if (source->type != Image::Type::pgm || source->bpp != 8) 
 		throw "Only 8 bit PGM input images are allowed";
-	if (destination->type != Image::Type::lab)
-		throw "Only Lab output images are allowed";
+	if (destination->type != Image::Type::ppm || destination->bpp != 8)
+		throw "Only 8 bit PPM output images are allowed";
 
 	dim3 gridSizeQ = {
 		(((int)source->width /2 + blockSize.x - 1) / blockSize.x),
@@ -138,7 +124,10 @@ void PronkFilter::run(cudaStream_t stream)
 	};
 
 	f_pronk_y <<< gridSizeQ, blockSize, 0, stream >>> (
-		(float3*)destination->mem.device.data, destination->mem.device.pitch,
+		(float3*)imm->mem.device.data, imm->mem.device.pitch,
 		(uint8_t*)source->mem.device.data, source->mem.device.pitch,
 		source->width, source->height);
+
+	destination->fromLab(imm, stream);
+	delete imm;
 }

@@ -1,10 +1,4 @@
-#include <cuda_runtime.h>
-#include <operators.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <math.h>
-#include <image.h>
+#include <filter.h>
 
 class SobelFilter
 {

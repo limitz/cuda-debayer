@@ -6,8 +6,9 @@
 #include <math.h>
 #include <sys/stat.h>
 
-#define WIDTH 3840
-#define HEIGHT 2160
+
+#define WIDTH 1920
+#define HEIGHT 1080
 
 #include <display.h>
 #include <pthread.h>
@@ -15,6 +16,8 @@
 #include <operators.h>
 #include <image.h>
 #include <sobel.h>
+#include <hamilton.h>
+#include <gunturk.h>
 #include <pronk.h>
 #include <view.h>
 
@@ -311,287 +314,6 @@ void f_pgm8_debayer_nn_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_
 	d(1,1) = make_uchar3(s(2,2), (s(1,2) + s(2,1)) >> 1, s(1,1));
 }
 
-__global__
-void f_pgm8_debayer_adams_gg_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x >= width || y >= height) return;
-	
-	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
-	
-	// greens
-	d(0,0) = make_uchar3(0, 0, 0);
-	d(1,0) = make_uchar3(0, s(1,0), 0);
-	d(0,1) = make_uchar3(0, s(0,1), 0);
-	d(1,1) = make_uchar3(0, 0, 0);
-
-	// greens at red / blue positions
-	int treshold = 1;
-
-	#pragma unroll
-	for (int i=0; i<2; i++)
-	{
-		float green;
-		int dh = abs(s(i-1,i)-s(i+1,i))+abs(2*s(i,i)-s(i+2,i)-s(i-2,i));
-		int dv = abs(s(i,i-1)-s(i,i+1))+abs(2*s(i,i)-s(i,i+2)-s(i,i-2));
-		
-		if (dh > dv+treshold) 
-			green = (s(i,i-1)+s(i,i+1))*0.5f+(2*s(i,i)-s(i,i-2)-s(i,i+2))*0.25f;
-		else if (dv > dh+treshold) 
-			green = (s(i-1,i)+s(i+1,i))*0.5f+(2*s(i,i)-s(i-2,i)-s(i+2,i))*0.25f;
-		else
-			green = (s(i,i-1)+s(i,i+1)+s(i-1,i)+s(i+1,i))*0.25f 
-			      + (4*s(i,i)-s(i,i-2)-s(i,i+2)-s(i-2,i)-s(i+2,i))*0.125f;
-
-		d(i,i).y = (uint8_t) clamp(green, 0.0f, 255.0f);
-	}
-}
-
-__global__
-void f_pgm8_debayer_adams_rb_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x >= width || y >= height) return;
-	
-	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
-	auto s = View2DSym<uint8_t>(in, pitch_in,  x, y, width, height);
-	
-	d(0,0).x = (s(0,0));
-	d(0,0).z = (s(-1,-1)+s(1,-1)+s(-1,1)+s(1,1)) >> 2;
-	d(1,1).x = (s( 0, 0)+s(2, 0)+s( 0,2)+s(2,2)) >> 2;
-	d(1,1).z = (s(1,1));
-	d(1,0).x = (s( 0, 0)+s(2, 0)) >> 1;
-	d(1,0).z = (s( 1,-1)+s(1, 1)) >> 1;
-	d(0,1).x = (s( 0, 0)+s(0, 2)) >> 1;
-	d(0,1).z = (s(-1, 1)+s(1, 1)) >> 1;
-}
-
-__constant__ __device__ float gunturk_h00[9];
-__constant__ __device__ float gunturk_h10[9];
-__constant__ __device__ float gunturk_h01[9];
-__constant__ __device__ float gunturk_h11[9];
-__constant__ __device__ float gunturk_g00[25];
-__constant__ __device__ float gunturk_g10[25];
-__constant__ __device__ float gunturk_g01[25];
-__constant__ __device__ float gunturk_g11[25];
-__device__ float3* gunturk_ca;
-__device__ float3* gunturk_ch;
-__device__ float3* gunturk_cv;
-__device__ float3* gunturk_cd;
-__device__ float3* gunturk_temp;
-__device__ size_t gunturk_pitch;
-
-void setupGunturk(cudaStream_t stream, size_t width, size_t height)
-{
-	float ph0[3] = {  0.25f,   0.5f,  0.25f };
-	float ph1[3] = {  0.25f,  -0.5f,  0.25f };
-	float pg0[5] = { -0.125f, 0.25f,  0.75f, 0.25f, -0.125f };
-	float pg1[5] = {  0.125f, 0.25f, -0.75f, 0.25f,  0.125f };
-
-	float ph00[9],  ph10[9],  ph01[9],  ph11[9];
-	float pg00[25], pg10[25], pg01[25], pg11[25];
-
-	for (int i=0; i<3; i++) for (int j=0; j<3; j++)
-	{
-		ph00[i*3+j] = ph0[i] * ph0[j];
-		ph10[i*3+j] = ph1[i] * ph0[j];
-		ph01[i*3+j] = ph0[i] * ph1[j];
-		ph11[i*3+j] = ph1[i] * ph1[j];
-	}
-	for (int i=0; i<5; i++) for (int j=0; j<5; j++)
-	{
-		pg00[i*5+j] = pg0[i] * pg0[j];
-		pg10[i*5+j] = pg1[i] * pg0[j];
-		pg01[i*5+j] = pg0[i] * pg1[j];
-		pg11[i*5+j] = pg1[i] * pg1[j];
-	}
-
-	int rc;
-	float3 *ca, *ch, *cv, *cd, *temp;
-	size_t pitch;
-	
-	rc  = cudaMallocPitch(&ca, &pitch, sizeof(float3) * width, height);
-	rc |= cudaMallocPitch(&ch, &pitch, sizeof(float3) * width, height);
-	rc |= cudaMallocPitch(&cv, &pitch, sizeof(float3) * width, height);
-	rc |= cudaMallocPitch(&cd, &pitch, sizeof(float3) * width, height);
-	rc |= cudaMallocPitch(&temp, &pitch, sizeof(float3) * width, height);
-	if (cudaSuccess != rc) throw "Unable to allocate gunturk intermediate buffers";
-	
-	rc  = cudaMemcpyToSymbolAsync(gunturk_h00, &ph00, 9*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_h10, &ph10, 9*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_h01, &ph01, 9*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_h11, &ph11, 9*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_g00, &pg00, 25*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_g10, &pg10, 25*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_g01, &pg01, 25*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_g11, &pg11, 25*sizeof(float), 0, cudaMemcpyHostToDevice, stream);
-	if (cudaSuccess != rc) throw "Unable to copy gunturk filters";
-	
-	rc  = cudaMemcpyToSymbolAsync(gunturk_ca, &ca, sizeof(float3*), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_ch, &ch, sizeof(float3*), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_cv, &cv, sizeof(float3*), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_cd, &cd, sizeof(float3*), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_temp, &temp, sizeof(float3*), 0, cudaMemcpyHostToDevice, stream);
-	rc |= cudaMemcpyToSymbolAsync(gunturk_pitch, &pitch, sizeof(size_t), 0, cudaMemcpyHostToDevice, stream);
-	if (cudaSuccess != rc) throw "Unable to set gunturk intermediate buffers";
-}
-
-__global__
-void f_pgm8_debayer_gunturk_gg1_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{ 
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x >= width || y >= height) return;
-
-	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto s = View2DSym<uint8_t>(in, pitch_in, x, y, width, height);
-	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
-	
-	float*h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
-
-	ca(0,0) = ch(0,0) = cv(0,0) = cd(0,0) = make_float3(0,0,0); 
-	ca(0,1) = ch(0,1) = cv(0,1) = cd(0,1) = make_float3(0,0,0); 
-	ca(1,0) = ch(1,0) = cv(1,0) = cd(1,0) = make_float3(0,0,0); 
-	ca(1,1) = ch(1,1) = cv(1,1) = cd(1,1) = make_float3(0,0,0); 
-
-	for (int r=-2; r<4; r+=2)
-	{
-		#pragma unroll
-		for (int c=-2; c<4; c+=2, h00++, h10++, h01++, h11++)
-		{
-			uint8_t rr = s(c, r), bb = s(c+1, r+1);
-			ca(0,0).x += rr * *h00,	ca(1,1).z += bb * *h00;
-			ch(0,0).x += rr * *h10,	ch(1,1).z += bb * *h10;
-			cv(0,0).x += rr * *h01, cv(1,1).z += bb * *h01;
-			cd(0,0).x += rr * *h11,	cd(1,1).z += bb * *h11;
-			ca(0,0).y += d(c, r).y * *h00;
-			ca(1,1).y += d(c+1, r+1).y * *h00;
-			
-		}
-	}
-	ch(0,0).y = ch(0,0).x, cv(0,0).y = ch(0,0).x, cd(0,0).y = cd(0,0).x;
-	ch(1,1).y = ch(1,1).z, cv(1,1).y = cv(1,1).z, cd(1,1).y = cd(1,1).z;
-}
-
-
-__global__
-void f_pgm8_debayer_gunturk_gg2_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
-	if (x >= width || y >= height) return;
-
-	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto temp = View2DSym<float3>(gunturk_temp, gunturk_pitch, x, y, width, height);
-	auto s = View2DSym<uint8_t>(in, pitch_in, x, y, width, height);
-	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
-
-	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
-	
-	temp(0,0) =  temp(1,0) = temp(0,1) = temp(1,1) = make_float3(0,0,0);
-
-	for (int r=-4; r<6; r+=2)
-	{
-		#pragma unroll
-		for (int c=-4; c<6; c+=2, g00++, g10++, g01++, g11++)
-		{
-			temp(0,0).y += ca(c,r).y * *g00
-			             + ch(c,r).y * *g10
-			             + cv(c,r).y * *g01
-			             + cd(c,r).y * *g11;
-			
-			temp(1,1).y += ca(c+1,r+1).y * *g00
-			             + ch(c+1,r+1).y * *g10
-			             + cv(c+1,r+1).y * *g01
-			             + cd(c+1,r+1).y * *g11;
-		}
-	}
-	d(0,0).x = s(0,0);
-	d(1,1).z = s(1,1);
-	d(0,0).y = clamp(temp(0,0).y, 0.f, 255.f);
-	d(1,1).y = clamp(temp(1,1).y, 0.f, 255.f);
-}
-
-__global__
-void f_pgm8_debayer_gunturk_rb1_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{ 
-	int x = (blockIdx.x * blockDim.x + threadIdx.x) ;
-	int y = (blockIdx.y * blockDim.y + threadIdx.y);
-	if (x >= width || y >= height) return;
-
-	auto ca = &View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height)(0,0);
-	auto ch = &View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height)(0,0);
-	auto cv = &View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height)(0,0);
-	auto cd = &View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height)(0,0);
-	auto d = View2DSym<uchar3>(out, pitch_out, x, y, width, height);
-	
-	float *h00 = gunturk_h00, *h10 = gunturk_h10, *h01 = gunturk_h01, *h11 = gunturk_h11;
-
-	*ca = *ch = *cv = *cd = make_float3(0,0,0); 
-	
-	#pragma unroll
-	for (int r=-1; r<2; r++)
-	{
-		#pragma unroll
-		for (int c=-1; c<2; c++, h00++, h10++, h01++, h11++)
-		{
-			uchar3 v = d(c, r);
-			float3 f = make_float3(v.x, v.y, v.z);
-			*ca += f * *h00;
-			*ch += f * *h10;
-			*cv += f * *h01;
-			*cd += f * *h11;
-		}
-	}
-	ch->x = ch->z = ch->y;
-	cv->x = cv->z = cv->y;
-	cd->x = cd->z = cd->y;
-}
-
-__global__
-void f_pgm8_debayer_gunturk_rb2_ppm8(void* out, size_t pitch_out, void* in, size_t pitch_in, size_t width, size_t height)
-{
-	int x = (blockIdx.x * blockDim.x + threadIdx.x);
-	int y = (blockIdx.y * blockDim.y + threadIdx.y);
-	if (x >= width || y >= height) return;
-
-	auto ca = View2DSym<float3>(gunturk_ca, gunturk_pitch, x, y, width, height);
-	auto ch = View2DSym<float3>(gunturk_ch, gunturk_pitch, x, y, width, height);
-	auto cv = View2DSym<float3>(gunturk_cv, gunturk_pitch, x, y, width, height);
-	auto cd = View2DSym<float3>(gunturk_cd, gunturk_pitch, x, y, width, height);
-	auto t = &View2DSym<float3>(gunturk_temp, gunturk_pitch, x, y, width, height)(0,0);
-	auto d = &View2DSym<uchar3>(out, pitch_out, x, y, width, height)(0,0);
-
-	float *g00 = gunturk_g00, *g10 = gunturk_g10, *g01 = gunturk_h01, *g11 = gunturk_g11;
-	
-	*t = make_float3(0,0,0);
-	
-	#pragma unroll
-	for (int r=-2; r<3; r++)
-	{
-		#pragma unroll
-		for (int c=-2; c<3; c++, g00++, g10++, g01++, g11++)
-		{
-			*t += ca(c,r) * *g00
-			    + ch(c,r) * *g10
-			    + cv(c,r) * *g01
-			    + cd(c,r) * *g11;
-		}
-	}
-
-	d->x = IS_R(x,y) * d->x + (1-IS_R(x,y)) * clamp(t->x, 0.0f, 255.0f);
-	d->z = IS_B(x,y) * d->z + (1-IS_B(x,y)) * clamp(t->z, 0.0f, 255.0f);
-}
-
 int smToCores(int major, int minor)
 {
 	switch ((major << 4) | minor)
@@ -697,13 +419,10 @@ int main(int /*argc*/, char** /*argv*/)
 		rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 		if (cudaSuccess != rc) throw "Unable to create CUDA stream";
 
-		auto original = Image::load("testimages.ppm");
+		auto original = Image::load("kodak.ppm");
 		original->copyToDevice(stream);
 		original->printInfo();
 	
-		auto lab = Image::create(Image::lab, original->width, original->height);
-		original->toLab(lab, stream);
-
 		auto bayer = Image::create(Image::Type::pgm, original->width, original->height);
 		f_ppm8_bayer_pgm8<<<gridSize, blockSize, 0, stream>>>(
 				bayer->mem.device.data,
@@ -722,15 +441,7 @@ int main(int /*argc*/, char** /*argv*/)
 				bayer->width,
 				bayer->height
 		);
-#if 0
-		f_ppm8_to_cielab<<<gridSize, blockSize, 0, stream>>>(
-				cielab, cielab_pitch, 
-				(uchar3*) bayer_colored->mem.device.data,
-				bayer_colored->mem.device.pitch,
-				bayer_colored->width,
-				bayer_colored->height
-		);
-#endif
+		
 		setupMalvar(stream);
 		auto debayer_lab = Image::create(Image::Type::lab, original->width, original->height);
 
@@ -740,15 +451,10 @@ int main(int /*argc*/, char** /*argv*/)
 		auto debayer3 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer4 = Image::create(Image::Type::ppm, original->width, original->height);
 		auto debayer5 = Image::create(Image::Type::ppm, original->width, original->height);
-		auto black = Image::create(Image::Type::ppm, original->width, original->height);
-		auto funky1 = Image::create(Image::Type::ppm, original->width, original->height);
-		auto funky2 = Image::create(Image::Type::ppm, original->width, original->height);
-		
-		for (int i=0; i<black->width * black->height * black->channels; i++)
-		{
-			((uint8_t*)black->mem.host.data)[i] = 0x11;
-		}
-		black->copyToDevice(stream);
+		auto black    = Image::create(Image::Type::ppm, original->width, original->height);
+		auto mask     = Image::create(Image::Type::raw, original->width, original->height, 3, 32);
+		auto lab      = Image::create(Image::Type::lab, original->width, original->height);
+		auto enhanced = Image::create(Image::Type::ppm, original->width, original->height);
 
 		// NEAREST NEIGHBOR
 		f_pgm8_debayer_nn_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
@@ -784,123 +490,41 @@ int main(int /*argc*/, char** /*argv*/)
 		debayer2->copyToHost(stream);
 		
 		// HAMILTON ADAMS
-		f_pgm8_debayer_adams_gg_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer3->mem.device.data,
-				debayer3->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer3->mem.device.data,
-				debayer3->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
+		HamiltonFilter hamilton;
+		hamilton.source = bayer;
+		hamilton.destination = debayer3;
+		hamilton.run(stream);
 		debayer3->copyToHost(stream);
 
-		// GUNTURK / ADAMS
-		setupGunturk(stream, bayer->width, bayer->height);
-		f_pgm8_debayer_adams_gg_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-#if 0
-		f_pgm8_debayer_adams_rb_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-#endif
-		f_pgm8_debayer_gunturk_gg1_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-		
-		f_pgm8_debayer_gunturk_gg2_ppm8<<<gridSizeQ, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-		);
-		for (int i=0; i<24; i++)
-		{
-			f_pgm8_debayer_gunturk_rb1_ppm8<<<gridSize, blockSize, 0, stream>>>(	
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-			);
-		
-			f_pgm8_debayer_gunturk_rb2_ppm8<<<gridSize, blockSize, 0, stream>>>(
-				debayer4->mem.device.data,
-				debayer4->mem.device.pitch,
-				bayer->mem.device.data,
-				bayer->mem.device.pitch,
-				bayer->width,
-				bayer->height
-			);
-		}
+		// GUNTURK
+		GunturkFilter gunturk;
+		gunturk.source = bayer;
+		gunturk.destination = debayer4;
+		gunturk.backend = HamiltonFilter();
+		gunturk.run(stream);
 		debayer4->copyToHost(stream);
 
-		// GUNTURK / MALVAR
-		auto mask = Image::create(Image::Type::raw, original->width, original->height, 3, 32);
-
-		SobelFilter sobel;
-		sobel.source = original;
-		sobel.destination = mask;
-		sobel.avgChannels = false;
-		sobel.power = 0.5;
-		sobel.run(stream);
-
+		// My own tests
 		PronkFilter pronk;
 		pronk.source = bayer;
-		pronk.destination = debayer_lab;
+		pronk.destination = debayer5;
 		pronk.run(stream);
-
-		f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
-				(uchar3*)debayer5->mem.device.data, debayer5->mem.device.pitch,
-				(uchar3*)debayer2->mem.device.data, debayer2->mem.device.pitch,
-				(uchar3*)debayer4->mem.device.data, debayer4->mem.device.pitch,
-				(float3*)mask->mem.device.data, mask->mem.device.pitch,
-				debayer5->width, debayer5->height);
-
 		debayer5->copyToHost(stream);
-
-
-		// SETUP DISPLAY
-		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
-		cudaDeviceSynchronize();
-		display.cudaMap(stream);
 		
+		cudaDeviceSynchronize();
 		printf("PSNR\n");
 		printf("- Nearest:  %0.02f\n", debayer0->psnr(original));
 		printf("- Bilinear: %0.02f\n", debayer1->psnr(original));
 		printf("- Malvar:   %0.02f\n", debayer2->psnr(original));
 		printf("- Adams:    %0.02f\n", debayer3->psnr(original));
 		printf("- Gunturk:  %0.02f\n", debayer4->psnr(original));
-		printf("- Gunturk Malvar: %0.02f\n", debayer5->psnr(original));
+		printf("- Pronk:    %0.02f\n", debayer5->psnr(original));
 		printf("Creating screen\n");
 
-
+		// SETUP DISPLAY
+		CudaDisplay display(TITLE, WIDTH, HEIGHT); 
+		display.cudaMap(stream);
+		
 		int i = 0;
 		int count = 10;
 		int scale = 1;
@@ -911,92 +535,74 @@ int main(int /*argc*/, char** /*argv*/)
 		float da=0, db=0;
 		bool s_only = false, l_only = false;
 		bool order = false;
-		Image* debayer[] = { bayer, bayer_colored, funky1, funky2,
-			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5 };
+		bool showEnhanced = false;
+
+		Image* images[] = { original, bayer, bayer_colored,
+			debayer0, debayer1, debayer2, debayer3, debayer4, debayer5, lab };
 		while (true)
 		{
-			sobel.run(stream);
-
-			f_cielab_enhance <<< gridSize, blockSize, 0, stream >>> (
-				(float3*)debayer_lab->mem.device.data, debayer_lab->mem.device.pitch,
-				debayer_lab->width, debayer_lab->height, angle, sat, bri, ofs, da, db
-			);
-			sat=1;
-			bri=1;
-			ofs=0;
-			da=0;
-			db=0;
-			original->fromLab(debayer_lab, stream);
-	
-			
-			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
-				(uchar3*)funky1->mem.device.data, funky1->mem.device.pitch,
-				(uchar3*)original->mem.device.data, original->mem.device.pitch,
-				(uchar3*)original->mem.device.data, original->mem.device.pitch,
-				(float3*)mask->mem.device.data, mask->mem.device.pitch,
-				original->width, original->height);
-			
-			Image* d1 = order ? black : original;
-			Image* d2 = order ? original : black;
-
-			f_ppm8_blend<<<gridSize, blockSize, 0, stream>>>(
-				(uchar3*)funky2->mem.device.data, funky2->mem.device.pitch,
-				(uchar3*)d1->mem.device.data, black->mem.device.pitch,
-				(uchar3*)d2->mem.device.data, original->mem.device.pitch,
-				(float3*)mask->mem.device.data, mask->mem.device.pitch,
-				original->width, original->height);
-			
-			if (!i)
+			Image* img = images[i % count];
+			if (img->type == Image::Type::ppm && showEnhanced)
 			{
-#if 0
-				f_pgm8<<<gridSize, blockSize, 0, stream>>>(
+				img->toLab(lab, stream);
+
+				f_cielab_enhance <<< gridSize, blockSize, 0, stream >>> (
+					(float3*)lab->mem.device.data, lab->mem.device.pitch,
+					lab->width, lab->height, angle, sat, bri, ofs, da, db);
+			
+				enhanced->fromLab(lab, stream);
+				img = enhanced;
+			}	
+			
+			switch (img->type)
+			{
+			case Image::Type::pgm:
+				f_pgm8 <<< gridSize, blockSize, 0, stream >>> (
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
-					bayer->mem.device.data,
-					bayer->mem.device.pitch,
-					bayer->width,
-					bayer->height,
+					img->mem.device.data,
+					img->mem.device.pitch,
+					img->width,
+					img->height,
+					scale,
+					dx*scale, dy*scale);
+				break;
+
+			case Image::Type::ppm:
+				f_ppm8 <<< gridSize, blockSize, 0, stream >>> (
+					display.CUDA.frame.data,
+					display.CUDA.frame.pitch,
+					img->mem.device.data,
+					img->mem.device.pitch,
+					img->width,
+					img->height,
 					scale,
 					dx*scale, dy*scale
 				);
-#else
-				f_cielab<<<gridSize, blockSize, 0, stream>>>(
+				break;
+
+			case Image::Type::lab:
+				f_cielab <<< gridSize, blockSize, 0, stream >>> (
 					display.CUDA.frame.data,
 					display.CUDA.frame.pitch,
-					debayer_lab->mem.device.data,
-					debayer_lab->mem.device.pitch,
-					debayer_lab->width,
-					debayer_lab->height,
+					img->mem.device.data,
+					img->mem.device.pitch,
+					img->width,
+					img->height,
 					scale,
 					dx*scale, dy*scale,
-					l_only, s_only
-				);
-#endif
-			}
-			else
-			{
-				f_ppm8<<<gridSize, blockSize, 0, stream>>>(
-					display.CUDA.frame.data,
-					display.CUDA.frame.pitch,
-					debayer[i%count]->mem.device.data,
-					debayer[i%count]->mem.device.pitch,
-					debayer[i%count]->width,
-					debayer[i%count]->height,
-					scale,
-					dx*scale, dy*scale
-				);
+					l_only, s_only);
+				break;
+
 			}
 
 			cudaStreamSynchronize(stream);
-			// Draw the pixelbuffer on screen
 			display.cudaFinish(stream);
 			display.render(stream);
 		
 			rc = cudaGetLastError();
 			if (cudaSuccess != rc) throw "CUDA ERROR";
 
-			Image* img;
-			// check escape pressed
 			if (int e = display.events()) 
 			{
 				if (e < 0)
@@ -1011,60 +617,22 @@ int main(int /*argc*/, char** /*argv*/)
 					case '.': i++; if (i >= count) i=0; break;
 					case '-': scale--; if (scale <= 0) scale = 1; break;
 					case '=': scale++; if (scale >= 32) scale = 32; break;
-					case 'w': dy+=10; break;
-					case 's': dy-=10; break;
-					case 'a': dx+=10; break;
-					case 'd': dx-=10; break;
-					case 'z': sobel.power *= 0.8; break;
-					case 'x': sobel.power /= 0.8; break;
-					case 'c': sobel.avgChannels = !sobel.avgChannels; break;
-					case '[': bri = 1.1f; break;
-					case ']': bri = 1.0f/1.1f; break;
-					case ';': sat = 1.1f; break;
-					case '\'':sat = 1.0f/1.1f; break;
-					case 'v': 
-						img = Image::load("castle.ppm");
-						img->printInfo();
-						img->copyToDevice(stream);
-						img->toLab(lab, stream);
-						cudaStreamSynchronize(stream);
-						delete img;
-						break;
-					case 'b': 
-						img = Image::load("sheep.ppm");
-						img->printInfo();
-						img->copyToDevice(stream);
-						img->toLab(lab, stream);
-						cudaStreamSynchronize(stream);
-						delete img;
-						break;
-					case 'n':
-						ofs = 10;
-						break;
-					case 'm':
-						ofs = -10;
-						break;
-					case 'h':
-						da = 5;
-						break;
-					case 'j':
-						da = -5;
-						break;
-					case 'y':
-						db = 5;
-						break;
-					case 'u':
-						db = -5;
-						break;
-					case 'i':
-						l_only = !l_only;
-						break;
-					case 'o':
-						s_only = !s_only;
-						break;
-					case 'p':
-						order = !order;
-						break;
+					case 'w': dy-=10; break;
+					case 's': dy+=10; break;
+					case 'a': dx-=10; break;
+					case 'd': dx+=10; break;
+					case '[': bri *= 1.1f; break;
+					case ']': bri /= 1.1f; break;
+					case ';': sat *= 1.1f; break;
+					case '\'':sat /= 1.1f; break;
+					case 'n': ofs += 5;break;
+					case 'm': ofs -= 5;break;
+					case 'h': da += 3;break;
+					case 'j': da -= 3;break;
+					case 'y': db += 3;break;
+					case 'u': db -= 5;break;
+					case 'i': l_only = !l_only;break;
+					case 'o': s_only = !s_only; break;
 					case '0': 
 					case '1':
 					case '2':
@@ -1074,9 +642,13 @@ int main(int /*argc*/, char** /*argv*/)
 					case '6':
 					case '7':
 					case '8':
-					case '9':
-						  i = e - '0';
-						  break;
+					case '9': i = e - '0'; break;
+					case 'q': 
+						bri = 1, sat = 1,
+						da = 0, db = 0, ofs = 0;
+						break;
+					case 'r':
+						dx = 0, dy = 0, scale = 1;
 					default: break;
 				}
 			}

@@ -2,9 +2,11 @@
 #include <filter.h>
 #include <debayer.h>
 
-class PronkFilter : public Filter
+class HamiltonFilter : public Filter
 {
 public:
-	PronkFilter() : Filter("Pronk test") {}
+	HamiltonFilter() : Filter("Hamilton-Adams") {}
 	virtual void run(cudaStream_t stream) override;
+
+	size_t threshold = 1;
 };
